@@ -1,0 +1,161 @@
+// CoherenceRequestType
+enumeration(CoherenceRequestType, desc="...") {
+  GETX,      desc="Get eXclusive(when receiving Store)";
+  GETS,      desc="Get eXclusive(when receiving Load)";
+  GET_INSTR, desc="Get eXclusive(when receiving Ifetch)";
+  PUTX,      desc="Put eXclusive";
+  PUTX_COPY, desc="Data block to be copied in L2. L1 will still be in M state";
+  //INV,       desc="Invalidation";
+  INV_OWN,   desc="Invalidate request from own L2";
+  INV_ELSE,  desc="Invalidate request from other's L2";
+  INV,       desc="Invalidate request from L3";
+  L1_STORE_DATA, desc="L1 hit, sending new data to L2 at the same time";
+  L1I_STORE_DATA, desc="L1 miss, receiving old data from L2 and update the old data, then sends the new data to L2";
+  //L2_VALID,  desc="L2 tells L3 that there is at least a L2 valid, in order to change L3 from M to MT";
+}
+
+// CoherenceResponseType
+enumeration(CoherenceResponseType, desc="...") {
+  WB_ACK,    desc="when L2 receives data from L1, it sends WB_ACK to the cache (ps. there may be other cases that I haven't found out yet)";
+  WB_NACK,   desc="Writeback neg. ack";  ////****TODO // don't know whether we really need this?
+  ACK,               desc="when L2 receives data from L3, it sends ACK to the cache (ps. there may be other cases that I haven't found out yet)"; ////****TODO // don't know whether really need it?
+  DATA,              desc="Data block in L2 cache in M state";
+  STALE_DATA,        desc="Still dont understand the function yet";
+  
+  // in MESI-2/3-LEVEL, there is a Type DATA_EXCLUSIVE, which is sent from L3 to L2
+  // the difference between DATA and DATA_EXCLUSIVE is that: when L2 receives DATA, it transfers to S state, and this block is not the only copy,
+  //                                                         when L2 receives DATA_EXCLUSIVE, it transfers to M state, indicating that this block is the only copy
+  MEMORY_DATA,       desc="Data from memory";
+  //MEMORY_READ,       desc="Mem sends MEMORY_READ to dir, dir then trigger Memory_data event";
+
+  // Request types for sending data and acks from L0 to L1 cache
+  // when an invalidation message is received.
+  INV_DATA;
+  DATA_INV_ACK,      desc="L1 sends L2 data and invalidation ack, informing L2 that this L1 block is I now";
+  //L2_ACK,            desc="L2 tells L1 that it receives data";
+  INV_ACK;
+  INV_ACK_MI_I,      desc="L1 transfer from MI to I, and need to inform L2 of that";
+  INV,               desc="Invalidate from directory";
+  MEM_INV,           desc="memory wants to invalidate the block in L3 cache";
+  MEMORY_ACK,        desc="memory informs L3 that it has transfered to I state";
+  //MEMORY_WB,         desc="memory resp to dir, indicating that data has already written into memory";
+  
+  UNBLOCK,                desc="Unblock from L2 requestor, for other blocking states";
+  NAK,       desc="L1 sends L2 NAK, meaning that data in L2 is the latest";
+  //EXCLUSIVE_UNBLOCK,      desc="Unblock from L2 requestor, for MT_MB state only";
+ /*  DATA_EXCLUSIVE_CLEAN, desc="Data, no other processor has a copy, data is clean";
+  DATA_EXCLUSIVE_DIRTY, desc="Data, no other processor has a copy, data is dirty";
+  UNBLOCK,           desc="Unblock";
+  UNBLOCK_EXCLUSIVE, desc="Unblock, we're in E/M";
+  WRITEBACK_CLEAN,   desc="Clean writeback (no data)";
+  WRITEBACK_DIRTY,   desc="Dirty writeback (contains data)";
+  WRITEBACK,         desc="Generic writeback (contains data)"; */
+}
+
+// CoherenceMsgType
+// enumeration(CoherenceMsgType, desc="...") {
+//   // Req
+//   GETX,      desc="Get eXclusive(when receiving Store)";
+//   GETS,      desc="Get eXclusive(when receiving Load)";
+//   GET_INSTR, desc="Get eXclusive(when receiving Ifetch)";
+//   PUTX,      desc="Put eXclusive";
+//   PUTX_COPY, desc="Data block to be copied in L2. L1 will still be in M state";
+//   //INV,       desc="Invalidation";
+//   INV_OWN,   desc="Invalidate request from own L2";
+//   INV_ELSE,  desc="Invalidate request from other's L2";
+
+//   // Resp
+//   WB_ACK,    desc="Writeback ack";
+//   WB_NACK,   desc="Writeback neg. ack";  ////****TODO // don't know whether we really need this?
+//   ACK,               desc="ACKnowledgment, responder doesn't have a copy"; ////****TODO // don't know whether really need it?
+//   DATA,              desc="Data block in L2 cache in M state";
+//   STALE_DATA,        desc="Still dont understand the function yet";
+
+//   // Request types for sending data and acks from L0 to L1 cache
+//   // when an invalidation message is received.
+//   INV_DATA;
+//   INV_ACK;
+
+//   NAK,       desc="L1 sends L2 NAK, meaning that data in L2 is the latest";
+// }
+
+// RequestMsg
+structure(RequestMsg, desc="...", interface="Message") {
+  Addr addr,              desc="Physical address for this request";
+  CoherenceRequestType Type,    desc="Type of request (GetS, GetX, PutX, etc)";
+  RubyAccessMode AccessMode,    desc="user/supervisor access type";
+  MachineID Requestor      ,    desc="What component request";
+  NetDest Destination,          desc="What components receive the request, includes MachineType and num";
+  MessageSizeType MessageSize,  desc="size category of the message";
+  DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
+  int Len;
+  bool Dirty, default="false",  desc="Dirty bit";
+
+  bool functionalRead(Packet *pkt) {
+    // Only PUTX messages contains the data block
+    if (Type == CoherenceRequestType:PUTX) {
+        return testAndRead(addr, DataBlk, pkt);
+    }
+
+    return false;
+  }
+
+  bool functionalWrite(Packet *pkt) {
+    // No check on message type required since the protocol should
+    // read data from those messages that contain the block
+    return testAndWrite(addr, DataBlk, pkt);
+  }
+}
+
+// ResponseMsg
+structure(ResponseMsg, desc="...", interface="Message") {
+  Addr addr,              desc="Physical address for this request";
+  CoherenceResponseType Type,   desc="Type of response (Ack, Data, etc)";
+  MachineID Sender,             desc="What component sent the data";
+  NetDest Destination,          desc="Node to whom the data is sent";
+  DataBlock DataBlk,            desc="Data for the cache line";
+  bool Dirty, default="false",  desc="Dirty bit";
+  MessageSizeType MessageSize,  desc="size category of the message";
+
+  bool functionalRead(Packet *pkt) {
+    // Valid data block is only present in message with following types
+    if (Type == CoherenceResponseType:DATA) {
+        return testAndRead(addr, DataBlk, pkt);
+    }
+
+    return false;
+  }
+
+  bool functionalWrite(Packet *pkt) {
+    // No check on message type required since the protocol should
+    // read data from those messages that contain the block
+    return testAndWrite(addr, DataBlk, pkt);
+  }
+}
+
+// structure(CoherenceMsg, desc="...", interface="Message") {
+//   Addr addr,              desc="Physical address of the cache block";
+//   CoherenceMsgType Type,         desc="Type of message (GetS, GetX, PutX, etc)";
+//   RubyAccessMode AccessMode,    desc="user/supervisor access type";
+//   MachineID Sender,             desc="What component sent this message";
+//   MachineID Dest,        desc="What machine receives this message";
+//   MessageSizeType MessageSize,  desc="size category of the message";
+//   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
+//   bool Dirty, default="false",  desc="Dirty bit";
+//   //PrefetchBit Prefetch,         desc="Is this a prefetch request";
+
+//   bool functionalRead(Packet *pkt) {
+//     // Only PUTX messages contains the data block
+//     if (Type == CoherenceMsgType:PUTX) {
+//         return testAndRead(addr, DataBlk, pkt);
+//     }
+//     return false;
+//   }
+
+//   bool functionalWrite(Packet *pkt) {
+//     // No check on message type required since the protocol should
+//     // read data from those messages that contain the block
+//     return testAndWrite(addr, DataBlk, pkt);
+//   }
+// }
+

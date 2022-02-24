@@ -1,0 +1,1333 @@
+// 1. way to send msg through outport is in action using enqueue
+// 2. msg types and events are different
+////****TODO // 3. should there be WB_Nack?
+
+machine(MachineType:L2Cache, "MI Directory L2 Cache")
+ : CacheMemory * L2cache;
+   int l3_select_num_bits;   ////****TODO // don't know the function yet
+   Cycles l2_request_latency := 2;
+   Cycles l2_response_latency := 2;
+   Cycles to_l3_latency := 1;
+
+   // Message Buffers between the L1 and the L2 Cache
+   // L2 sends req to L1
+   MessageBuffer * requestToL1, network="To",
+        vnet_type="request";
+   // L2 sends resp to L1
+   MessageBuffer * responseToL1, network="To",
+        vnet_type="response";
+   // L2 receives req from L1
+   MessageBuffer * requestFromL1, network="From",
+        vnet_type="request";
+   // L2 receives resp from L1
+   MessageBuffer * responseFromL1, network="From",
+        vnet_type="response";
+
+
+   // L2 sends req to L3
+   MessageBuffer * requestToL3, network="To", virtual_network="0",
+        vnet_type="request";
+   // L2 sends resp to L3     
+   MessageBuffer * responseToL3, network="To", virtual_network="1",
+        vnet_type="response";
+   // L2 sends unblock to L3
+   MessageBuffer * unblockToL3, network="To", virtual_network="2",
+        vnet_type="unblock";
+
+   // L2 receives req from L3
+   MessageBuffer * requestFromL3, network="From", virtual_network="2",
+        vnet_type="request";
+   // L2 receives resp from L3 or other L2
+   MessageBuffer * responseFromL3L2, network="From", virtual_network="1",
+        vnet_type="response";
+
+{
+    // ***************************************STATES***************************//
+  state_declaration(State, desc="L2 Cache states", default="L2Cache_State_I"){  
+    ////****TODO // don't know whether the states are correct
+    // Base states
+    I, AccessPermission:Invalid, desc="L2 cache entry Idle";
+    M, AccessPermission:Maybe_Stale, desc="Line is present in modified state in L2 and present in L1";
+    Ma, AccessPermission:Maybe_Stale, desc="L2 is waiting for L1's new data";
+    MM, AccessPermission:Read_Write, desc="Line is present in modified state in L2 but not present in L1";
+
+    // Transient States
+    IS, AccessPermission:Busy, desc="L2 idle, issued GETS, have not seen response yet";
+    Inst_IS, AccessPermission:Busy, desc="L2 idle, issued GET_INSTR, have not seen response yet";
+    IM, AccessPermission:Busy, desc="L2 idle, issued GETX, have not seen response yet";
+    IS_I, AccessPermission:Busy, desc="L2 idle, issued GETS, saw Inv before data because directory doesn't block on GETS hit";
+    MI, AccessPermission:Busy, desc="L2 replacing, waiting for ACK";   // remember every core has a L2!
+    
+    // when block in L2 is replacing, L2 receives Inv, then L2 sends data to L3 and transfer to SINK_WB_ACK state
+    //                                            fwd_msg, triggered from L3 req GETs msg when the required cache line is not in L1 or is invalid in L2, then L2 sends data to requestor and transfer to SINK_WB_ACK state
+    // when receive WB_ACK from L3, SINK_WB_ACK transfer to I
+    // when receive Inv, send INV_ACK to L3 because the block is already invalid
+    // the reason why create this state is that 
+    SINK_WB_ACK, AccessPermission:Busy, desc="This is to sink WB_Acks from L3";   
+    
+    // For all of the following states, invalidate
+    // message has been sent to L1 cache. The response
+    // from the L1 cache has not been seen yet.
+    M_IL1, AccessPermission:Busy, desc="Modified in L2, invalidation sent to L1, have not seen response yet";
+    // when L2 receives data but not ACK from L1, it will turn to MM_IL1 state
+    // which means although L1 sends data to L2, it hasn't change to I state yet
+    MM_IL1, AccessPermission:Read_Write, desc="Invalidation sent to L1, have not seen response yet";  
+    
+    // to conclude: M_IL1 means L2 send INV msg to L1, but hasn't received ack nor data from L1
+    //              MM_IL1 means L2 has the latest L1 data, but hasn't received ack from L1 yet
+  }
+
+  // *****************************************EVENT************************************ //
+
+  enumeration(Event, desc="Cache events") {
+    ////****TODO // don't know whether the events are correct  
+    // Requests from the L1 cache
+    Load,            desc="Load request";
+    Store,           desc="Store request";
+    Ifetch,          desc="Instruction fetch";
+
+    // Responses from the L1 Cache
+    // L1 cache received the invalidation message
+    // and has sent the data.
+    L1_DataAck,      desc="Inform L2 that L1 sends data to L2 and L1 turns to I state";
+
+    Inv,           desc="Invalidate request from L3";
+
+    // internally generated requests:
+    L1_Invalidate_Own,  desc="Invalidate line in L1, due to this L2's requirements";
+    L1_Invalidate_Else, desc="Invalidate line in L1, due to another cache(L2/L3)'s requirements";
+    L2_Replacement,     desc="Invalidate line in L2, due to another cache's requirements";
+
+    // other requests
+    Fwd_GETX,   desc="GETX from other processor";
+    Fwd_GETS,   desc="GETS from other processor";
+    Fwd_GET_INSTR,    desc="GET_INSTR from other processor";
+
+    ////**** TODO maybe we can divide WriteBack into WB_clean/WB_dirty to optimize performence
+    L1_PUTX,       desc="triggered by PUTX msg from L1";      // this is a request
+    Data_fromL1,   desc="triggered by 3 fwd GETs and InvOwn from L1";     //this is a response
+    Data,       desc="L3 responses L2 with data";
+    //the difference of WriteBack and Data is where the data comes from, L1 or L3
+    DataS_fromL2,    desc="data for GETS req, need to unblock dir";  
+
+    WB_Ack,        desc="Ack for replacement";
+
+    // hardware transactional memory
+    L1_DataCopy,     desc="Data Block from L1. Should remain in M state.";
+
+    // L1 cache received the invalidation message and has
+    // sent a NAK (because of htm abort) saying that the data
+    // in L2 is the latest value.
+    L1_DataNak,      desc="L1 received INV message, specifies its data is also stale";
+    L1_StoreData,   desc="L1 hit, sends new data to L2 at the same time";
+    L1I_StoreData,   desc="L1 miss, forwarding new data to L2, L1 is in I state";
+    L1_Ack,          desc="L1 tells L2 that it has transfered to I state";
+    L1_Ack_MI_I,     desc="L1 tells L2 that it transfer from MI to I";
+  }  
+
+  // ***********************************************TYPES************************************************* //
+
+  // CacheEntry
+  structure(Entry, desc="...", interface="AbstractCacheEntry" ) {
+    State CacheState,        desc="cache state";
+    DataBlock DataBlk,       desc="data for the block";
+    bool Dirty, default="false",   desc="data is dirty";
+  }
+
+  // TBE fields
+  structure(TBE, desc="...") {
+    Addr addr,              desc="Physical address for this TBE";
+    State TBEState,        desc="Transient state";
+    DataBlock DataBlk,                desc="Buffer for the data block";
+    bool Dirty, default="false",   desc="data is dirty";
+    //int pendingAcks, default="0", desc="number of pending acks";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+  TBETable TBEs, template="<L2Cache_TBE>", constructor="m_number_of_TBEs";
+
+  int l3_select_low_bit, default="RubySystem::getBlockSizeBits()";   ////****TODO // don't konw the function yet
+
+  Tick clockEdge();
+  Cycles ticksToCycles(Tick t);
+  void set_cache_entry(AbstractCacheEntry a);
+  void unset_cache_entry();
+  void set_tbe(TBE a);
+  void unset_tbe();
+  void wakeUpBuffers(Addr a);
+  void wakeUpAllBuffers(Addr a);
+  void profileMsgDelay(int virtualNetworkType, Cycles c);
+
+  // inclusive cache returns L2 entries only
+  Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
+    Entry cache_entry := static_cast(Entry, "pointer", L2cache[addr]);
+    return cache_entry;
+  }
+
+  State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    if(is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    }
+    return State:I;
+  }
+  
+  void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+    // MUST CHANGE
+    if(is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+
+    if (is_valid(cache_entry)) {
+      cache_entry.CacheState := state;
+    }
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      DPRINTF(RubySlicc, "%s\n", L2Cache_State_to_permission(tbe.TBEState));
+      return L2Cache_State_to_permission(tbe.TBEState);
+    }
+
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(cache_entry)) {
+      DPRINTF(RubySlicc, "%s\n", L2Cache_State_to_permission(cache_entry.CacheState));
+      return L2Cache_State_to_permission(cache_entry.CacheState);
+    }
+
+    DPRINTF(RubySlicc, "%s\n", AccessPermission:NotPresent);
+    return AccessPermission:NotPresent;
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else {
+      testAndRead(addr, getCacheEntry(addr).DataBlk, pkt);
+    }
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+        testAndWrite(addr, tbe.DataBlk, pkt);
+      return num_functional_writes;
+    }
+
+    num_functional_writes := num_functional_writes +
+        testAndWrite(addr, getCacheEntry(addr).DataBlk, pkt);
+    return num_functional_writes;
+  }
+
+  void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+    if (is_valid(cache_entry)) {
+      cache_entry.changePermission(L2Cache_State_to_permission(state));
+    }
+  }
+
+  Event mandatory_request_type_to_event(CoherenceRequestType type) {
+    if (type == CoherenceRequestType:GETS) {
+      return Event:Load;
+    } else if (type == CoherenceRequestType:GETX) {
+      return Event:Store;
+    } else if (type == CoherenceRequestType:GET_INSTR) {
+      return Event:Ifetch;
+    } else if (type == CoherenceRequestType:PUTX) {
+      return Event:L1_PUTX;
+    } else {
+      error("Invalid RequestType");
+    }
+  }
+
+  bool inL1Cache(State state) {
+    if (state == State:M || state == State:M_IL1) {
+        return true;
+    }
+    return false;
+  }
+
+  out_port(L2requestL1Network_out, RequestMsg, requestToL1);        // L2->req->L1
+  out_port(L2requestL3Network_out, RequestMsg, requestToL3);        // L2->req->L3
+  // out_port(L2responseL1L3Network_out, ResponseMsg, responseToL1L3); // L2->resp->L1/L3
+  out_port(L2responseL1Network_out, ResponseMsg, responseToL1); // L2->resp->L1
+  out_port(L2responseL3Network_out, ResponseMsg, responseToL3); // L2->resp->L3
+  out_port(L2unblockL3Network_out, ResponseMsg, unblockToL3);           // L2->unblock->L3
+  
+  // L1->request->L2
+  in_port(L1requestL2Network_in, RequestMsg, requestFromL1, rank = 0) {
+    if(L1requestL2Network_in.isReady(clockEdge())) {
+      peek(L1requestL2Network_in, RequestMsg) {
+        assert(in_msg.Destination.isElement(machineID));
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+
+        DPRINTF(RubySlicc, "@L2-L1requestL2Network_in Addr: %#x State: %s Requestor: %s Type: %s Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+        if (in_msg.Type == CoherenceRequestType:PUTX_COPY) {
+
+            DPRINTF(RubySlicc, "@L2-L1requestL2Network_in Addr: %#x State: %s Requestor: %s Event: L1_DataCopy Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Destination);
+
+            trigger(Event:L1_DataCopy, in_msg.addr, cache_entry, tbe);  // copy data in L1 into L2
+
+        } else if (in_msg.Type == CoherenceRequestType:L1_STORE_DATA) {
+            DPRINTF(RubySlicc, "@L2-L1requestL2Network_in Addr: %#x State: %s Requestor: %s Event: L1_StoreData Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Destination);
+
+            trigger(Event:L1_StoreData, in_msg.addr, cache_entry, tbe);
+
+        } else if (in_msg.Type == CoherenceRequestType:L1I_STORE_DATA) {
+            DPRINTF(RubySlicc, "@L2-L1requestL2Network_in Addr: %#x State: %s Requestor: %s Event: L1_StoreData Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Destination);
+
+            trigger(Event:L1I_StoreData, in_msg.addr, cache_entry, tbe);
+
+        } else {
+            if (is_valid(cache_entry)) {
+                DPRINTF(RubySlicc, "@L2-L1requestL2Network_in cache_entry is valid Addr: %#x State: %s Requestor: %s Event: %s Destination: %s\n",
+                        in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                        in_msg.Requestor, mandatory_request_type_to_event(in_msg.Type), in_msg.Destination);
+
+                trigger(mandatory_request_type_to_event(in_msg.Type),  // L1 sends L2 CPU requests, indicating a L1 miss
+                        in_msg.addr, cache_entry, tbe);
+            } else {
+                
+                
+                if (L2cache.cacheAvail(in_msg.addr)) {
+                    // L2 does't have the line, but we have space for it
+                    // in the L2 let's see if the L3 has it
+                    // just send the req out
+
+                    DPRINTF(RubySlicc, "@L2-L1requestL2Network_in cache_entry is invalid but available Addr: %#x State: %s Requestor: %s Event: %s Destination: %s\n",
+                            in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                            in_msg.Requestor, mandatory_request_type_to_event(in_msg.Type), in_msg.Destination);
+
+                    trigger(mandatory_request_type_to_event(in_msg.Type),
+                            in_msg.addr, cache_entry, tbe);
+                } else {
+                    // No room in the L2, so we need to make room in the L2
+                    Addr victim := L2cache.cacheProbe(in_msg.addr);   // find the line that the most properiate to be replaced
+                    Entry victim_entry := getCacheEntry(victim);
+                    TBE victim_tbe := TBEs[victim];
+                    
+
+                    if (is_valid(victim_entry) && inL1Cache(victim_entry.CacheState)) {
+
+                    DPRINTF(RubySlicc, "@L2-L1requestL2Network_in cache_entry is invalid and unavailable, victim_entry is valid and is in L1, victim_Addr: %#x Addr_of_the_Requestor %#x victim_State: %s Requestor: %s Event: L1_Invalidate_Own Type_with_the_Requestor: %s Destination: %s\n",
+                            victim, in_msg.addr, getState(victim_tbe, victim_entry, victim),
+                            in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                        trigger(Event:L1_Invalidate_Own,  // if the block that is going to be replaced is in L1,
+                                                          // then we invalidate it first
+                                victim, victim_entry, victim_tbe);
+                    }  else {
+
+                      DPRINTF(RubySlicc, "@L2-L1requestL2Network_in cache_entry is invalid and unavailable, victim_entry is invalid or is not in L1, victim_Addr: %#x Addr_of_the_Requestor %#x victim_State: %s Requestor: %s Event: L2_Relplacement Type_with_the_Requestor: %s Destination: %s\n",
+                            victim, in_msg.addr, getState(victim_tbe, victim_entry, victim),
+                            in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                        trigger(Event:L2_Replacement,
+                                victim, victim_entry, victim_tbe);
+                    }
+                }
+            }
+        }
+
+        DPRINTF(RubySlicc, "@L2-L1requestL2Network_in Addr: %#x Next State: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr));
+
+      }
+    }
+  }
+
+  // L3->request->L2
+  in_port(L3requestL2Network_in, RequestMsg, requestFromL3, rank = 1) {
+    if(L3requestL2Network_in.isReady(clockEdge())) {
+      peek(L3requestL2Network_in, RequestMsg) {
+        assert(in_msg.Destination.isElement(machineID));
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+
+        DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x State: %s Requestor: %s Type: %s Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+        if (in_msg.Type == CoherenceRequestType:INV) {  // it has to come from L3
+            if (is_valid(cache_entry) && inL1Cache(cache_entry.CacheState)) {    // if cache_entry isn't valid in L2, obviously it is not valid in L1
+                                                                                  ////****TODO // why there needs two judgements? I think only the later one is needed 
+                
+                DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x State: %s Requestor: %s Event: L1_Invalidate_ELse Destination: %s\n",
+                      in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                      in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                trigger(Event:L1_Invalidate_Else, in_msg.addr,     // L3 sends INV, if block is available in both L1 and L2,
+                                                                   // we need to invalidate L1 first, trigger L1_Invalidate_Else, which means the INV comes from other L2 or L3 rather than own L2
+                        cache_entry, tbe);                        
+            }  else {
+
+                DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x State: %s Requestor: %s Event: Inv Destination: %s\n",
+                      in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                      in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                trigger(Event:Inv, in_msg.addr, cache_entry, tbe); // if block in L1 is invalid, we only need to invalidate L2
+            }          
+        } 
+        ////****TODO  // why L3 sent GETX/GETS/GET_INSTR?
+        // if L2 sends GETX/GETS/GET_INSTR to L3, L3 will send these back to L2, then L2 triggers Fwd events
+        else if (in_msg.Type == CoherenceRequestType:GETX) {
+            if (is_valid(cache_entry) && inL1Cache(cache_entry.CacheState)) {
+
+            DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x State: %s Requestor: %s Event: L1_Invalidate_Else Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                trigger(Event:L1_Invalidate_Else, in_msg.addr,
+                        cache_entry, tbe);
+            } else {
+
+              DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x State: %s Requestor: %s Event: Fwd_GETX Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                trigger(Event:Fwd_GETX, in_msg.addr, cache_entry, tbe);
+            }
+        } else if (in_msg.Type == CoherenceRequestType:GETS) {
+            if (is_valid(cache_entry) && inL1Cache(cache_entry.CacheState)) {
+
+              DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x State: %s Requestor: %s Event: L1_Invalidate_Else Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                trigger(Event:L1_Invalidate_Else, in_msg.addr,
+                        cache_entry, tbe);
+            } else {
+                
+              DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x State: %s Requestor: %s Event: Fwd_GETS Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                trigger(Event:Fwd_GETS, in_msg.addr, cache_entry, tbe);
+            }
+        } else if (in_msg.Type == CoherenceRequestType:GET_INSTR) {
+            if (is_valid(cache_entry) && inL1Cache(cache_entry.CacheState)) {
+
+              DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x State: %s Requestor: %s Event: L1_Invalidate_Else Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                trigger(Event:L1_Invalidate_Else, in_msg.addr,
+                        cache_entry, tbe);
+            } else {
+
+              DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x State: %s Requestor: %s Event: Fwd_GET_INSTR Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+                trigger(Event:Fwd_GET_INSTR, in_msg.addr, cache_entry, tbe);
+            }  
+        } else {
+          error("Invalid forwarded request type");
+        }
+
+        DPRINTF(RubySlicc, "@L2-L3requestL2Network_in Addr: %#x Next State: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr));
+      }
+    }
+  }
+
+  // L3/other L2->responses->L2
+  in_port(L3L2responseL2Network_in, ResponseMsg, responseFromL3L2, rank = 3) {
+    if (L3L2responseL2Network_in.isReady(clockEdge())) {
+      peek(L3L2responseL2Network_in, ResponseMsg) {
+        assert(in_msg.Destination.isElement(machineID));
+
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+        DPRINTF(RubySlicc, "@L2-L3L2responseL2Network_in Addr: %#x State: %s Sender: %s Type: %s Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Sender, in_msg.Type, in_msg.Destination);
+        
+        if(in_msg.Type == CoherenceResponseType:DATA) {
+          if((getState(tbe, cache_entry, in_msg.addr) == State:IS ||
+              getState(tbe, cache_entry, in_msg.addr) == State:IS_I) &&
+              machineIDToMachineType(in_msg.Sender) == MachineType:L2Cache) {
+              
+              DPRINTF(RubySlicc, "@L2-L3L2responseL2Network_in Addr: %#x State: %s Sender: %s Event: DataS_fromL2 Destination: %s\n",
+              in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+              in_msg.Sender, in_msg.Destination);
+
+              trigger(Event:DataS_fromL2, in_msg.addr, cache_entry, tbe);     // means data from L2, not from L3 or mem
+              
+            } else {
+
+              DPRINTF(RubySlicc, "@L2-L3L2responseL2Network_in Addr: %#x State: %s Sender: %s Event: Data %s Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Sender, in_msg.Destination);
+
+              trigger(Event:Data, in_msg.addr, cache_entry, tbe);
+            }
+          } else if (in_msg.Type == CoherenceResponseType:WB_ACK) {
+
+            DPRINTF(RubySlicc, "@L2-L3L2responseL2Network_in Addr: %#x State: %s Sender: %s Event: WB_Ack Destination: %s\n",
+              in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+              in_msg.Sender, in_msg.Destination);
+
+            trigger(Event:WB_Ack, in_msg.addr, cache_entry, tbe);
+          } 
+          else {
+            error("Invalid L3 response type");
+          }
+
+        DPRINTF(RubySlicc, "@L2-L3L2responseL2Network_in Addr: %#x Next State: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr));
+      }
+    }
+  }
+   
+  // L1->responses->L2
+  in_port(L1responseL2Network_in, ResponseMsg, responseFromL1, rank = 2) {
+    if (L1responseL2Network_in.isReady(clockEdge())) {
+      peek(L1responseL2Network_in, ResponseMsg) {
+        assert(in_msg.Destination.isElement(machineID));
+
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+        DPRINTF(RubySlicc, "@L2-L1responseL2Network_in Addr: %#x State: %s Sender: %s Type: %s Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Sender, in_msg.Type, in_msg.Destination);
+        
+        if(in_msg.Type == CoherenceResponseType:DATA_INV_ACK) {  // a used-to-be-Modified L1 block receives msg from L2,
+                                                      // sends data and INV_DATA to L2
+                                                      // L1 sends data to L2 and transfer from M to I
+          trigger(Event:L1_DataAck, in_msg.addr, cache_entry, tbe);
+        } else if (in_msg.Type == CoherenceResponseType:NAK) {   // L1 sends L2 NAK, saying that data in L2 is the latest
+          trigger(Event:L1_DataNak, in_msg.addr, cache_entry, tbe);  // L2 knows it has the latest data and that L1 receives INV
+        } else if (in_msg.Type == CoherenceResponseType:INV_ACK) {  // transient states who receives Inv, still in transient state
+          trigger(Event:L1_Ack, in_msg.addr, cache_entry, tbe);   // L1 tells L2 that it transfers to I state
+        } else if (in_msg.Type == CoherenceResponseType:INV_ACK_MI_I) {  // transient states who receives Inv, still in transient state
+          trigger(Event:L1_Ack_MI_I, in_msg.addr, cache_entry, tbe);   // L1 tells L2 that it transfers to I state
+        } else if (in_msg.Type == CoherenceResponseType:DATA) {   // L1 sends L2 data only when L1 is triggered by 3 fwd_GETs or InvOwn
+          trigger(Event:Data_fromL1, in_msg.addr, cache_entry, tbe);    // I add this line and the line above from self-analysis
+        } else {
+          error("Invalid L1 response type");
+        }
+
+        DPRINTF(RubySlicc, "@L2-L1responseL2Network_in Addr: %#x Next State: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr));
+      }
+    }
+  }
+
+  // ***********************************************ACTIONS*********************************************** //
+
+  action(aa_issueGETS, "\a", desc="Issue GETS") {
+    peek(L1requestL2Network_in, RequestMsg) {
+      enqueue(L2requestL3Network_out, RequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(mapAddressToRange(address, MachineType:L3Cache,
+                          l3_select_low_bit, l3_select_num_bits, clusterID));
+        DPRINTF(RubySlicc, "address: %////****x, destination: %s\n",
+                address, out_msg.Destination);
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+      }
+    }
+  }
+
+  action(ab_issueGET_INSTR, "ab", desc="Issue GET_INSTR") {
+    peek(L1requestL2Network_in, RequestMsg) {
+      enqueue(L2requestL3Network_out, RequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GET_INSTR;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(mapAddressToRange(address, MachineType:L3Cache,
+                          l3_select_low_bit, l3_select_num_bits, clusterID));
+        DPRINTF(RubySlicc, "address: %////****x, destination: %s\n",
+                address, out_msg.Destination);
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+      }
+    }
+  }
+
+  action(b_issueGETX, "b", desc="Issue GETX") {
+    peek(L1requestL2Network_in, RequestMsg) {
+      enqueue(L2requestL3Network_out, RequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETX;
+        out_msg.Requestor := machineID;
+        DPRINTF(RubySlicc, "%s\n", machineID);
+        out_msg.Destination.add(mapAddressToRange(address, MachineType:L3Cache,
+                          l3_select_low_bit, l3_select_num_bits, clusterID));
+        DPRINTF(RubySlicc, "address: %////****x, destination: %s\n",
+                address, out_msg.Destination);
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+      }
+    }
+  }
+
+  action(d_sendDataToRequestor, "d", desc="send data to requestor") {
+    peek(L3requestL2Network_in, RequestMsg) {
+      enqueue(L2responseL3Network_out, ResponseMsg, l2_response_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.Dirty := cache_entry.Dirty;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+    }
+  }
+
+  action(dt_sendDataToRequestor_fromTBE, "dt", desc="send data to requestor") {
+    peek(L3requestL2Network_in, RequestMsg) {
+      enqueue(L2responseL3Network_out, ResponseMsg, l2_response_latency) {
+        assert(is_valid(tbe));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.DataBlk := tbe.DataBlk;
+        out_msg.Dirty := tbe.Dirty;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+    }
+  }
+
+  action(f_sendDataToL3, "f", desc="send data to the L3 cache") {
+    enqueue(L2responseL3Network_out, ResponseMsg, l2_response_latency) {
+      assert(is_valid(cache_entry));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:DATA;
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.Dirty := cache_entry.Dirty;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(mapAddressToRange(address, MachineType:L3Cache,
+                          l3_select_low_bit, l3_select_num_bits, clusterID));
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
+    }
+  }
+  
+  action(ff_deallocateCacheBlock, "\f",
+         desc="Deallocate L2 cache block.") {
+    if (L2cache.isTagPresent(address)) {
+      L2cache.deallocate(address);
+    }
+    unset_cache_entry();
+  }
+
+  action(fi_sendInvAckToL3, "fi", desc="send invalidate ack to the L3 cache") {
+    peek(L3requestL2Network_in, RequestMsg) {
+      enqueue(L2responseL3Network_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        //out_msg.AckCount := 1;
+      }
+    }
+  }
+
+  action(fj_sendWBAckToL1Req, "fj", desc="send invalidate ack to the L1 cache(find destination from l1 req)") {
+    peek(L1requestL2Network_in, RequestMsg) {
+      enqueue(L2responseL1Network_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:WB_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        //out_msg.AckCount := 1;
+      }
+    }
+  }
+
+  
+  action(fk_sendInvAckToL1Resp, "fk", desc="send invalidate ack to the L1 cache(find destination from l1 resp)") {
+    peek(L1responseL2Network_in, ResponseMsg) {
+      enqueue(L2responseL1Network_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:WB_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        //out_msg.AckCount := 1;
+      }
+    }
+  }
+
+  // action(fl_sendL2ValidToL3Req, "fl", desc="send L2 valid information to L3, notified L3 that there's at least on L2 valid, change L3 from M to MT just in case") {
+  //   enqueue(L2requestL3Network_out, RequestMsg, l2_request_latency) {
+  //     assert(is_valid(cache_entry));
+  //     out_msg.addr := address;
+  //     out_msg.Type := CoherenceRequestType:L2_VALID;
+  //     //out_msg.DataBlk := cache_entry.DataBlk;
+  //     //out_msg.Dirty := cache_entry.Dirty;
+  //     out_msg.Requestor := machineID;
+  //     out_msg.Destination.add(mapAddressToRange(address, MachineType:L3Cache,
+  //                         l3_select_low_bit, l3_select_num_bits, clusterID));
+  //     out_msg.MessageSize := MessageSizeType:Control;
+  //   }
+  // }
+
+  action(forward_eviction_to_L1_own, "\cc", desc="sends (own) eviction information to the processor") {
+      enqueue(L2requestL1Network_out, RequestMsg, l2_request_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceRequestType:INV_OWN;
+          out_msg.Requestor := machineID;
+          out_msg.Destination.add(createMachineID(MachineType:L1Cache, version));
+          out_msg.MessageSize := MessageSizeType:Control;
+      }
+  }
+
+  action(forward_eviction_to_L1_else, "\cce", desc="sends (else) eviction information to the processor") {
+      enqueue(L2requestL1Network_out, RequestMsg, l2_request_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceRequestType:INV_ELSE;
+          out_msg.Requestor := machineID;
+          out_msg.Destination.add(createMachineID(MachineType:L1Cache, version));
+          out_msg.MessageSize := MessageSizeType:Control;
+      }
+  }
+
+  action(ft_sendDataToL3_fromTBE, "ft", desc="send data to the L3 cache") {
+    enqueue(L2responseL3Network_out, ResponseMsg, l2_response_latency) {
+      assert(is_valid(tbe));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:DATA;
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.Dirty := tbe.Dirty;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(mapAddressToRange(address, MachineType:L3Cache,
+                          l3_select_low_bit, l3_select_num_bits, clusterID));
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
+    }
+  }
+
+  action(g_issuePUTX, "g", desc="send data to the L3 cache") {
+    enqueue(L2requestL3Network_out, RequestMsg, l2_response_latency) {
+      assert(is_valid(cache_entry));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:PUTX;
+      out_msg.Dirty := cache_entry.Dirty;
+      out_msg.Requestor:= machineID;
+      out_msg.Destination.add(mapAddressToRange(address, MachineType:L3Cache,
+                          l3_select_low_bit, l3_select_num_bits, clusterID));
+      if (cache_entry.Dirty) {
+        out_msg.MessageSize := MessageSizeType:Writeback_Data;
+        out_msg.DataBlk := cache_entry.DataBlk;
+      } else {
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+      }
+    }
+  }
+
+  action(h_data_to_l1, "h", desc="If not prefetch, send data to the L1 cache.") {
+      enqueue(L2responseL1Network_out, ResponseMsg, l2_response_latency) {
+          assert(is_valid(cache_entry));
+
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(createMachineID(MachineType:L1Cache, version));
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.Dirty := cache_entry.Dirty; 
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+      L2cache.setMRU(address);
+  }
+
+  action(h_stale_data_to_l1, "hs", desc="If not prefetch, send data to the L1 cache.") {
+      enqueue(L2responseL1Network_out, ResponseMsg, l2_response_latency) {
+          assert(is_valid(cache_entry));
+
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:STALE_DATA;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(createMachineID(MachineType:L1Cache, version));
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.Dirty := cache_entry.Dirty;
+          out_msg.MessageSize := MessageSizeType:Response_Data;    // the data is stale
+       }
+  }
+
+  action(i_allocateTBE, "i", desc="Allocate TBE (number of invalidates=0)") {
+    check_allocate(TBEs);
+    assert(is_valid(cache_entry));
+    TBEs.allocate(address);
+    set_tbe(TBEs[address]);
+    tbe.Dirty := cache_entry.Dirty;
+    tbe.DataBlk := cache_entry.DataBlk;
+  }
+  
+  action(j_sendUnblock, "j", desc="send unblock to the L3 cache") {
+    enqueue(L2unblockL3Network_out, ResponseMsg, to_l3_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:UNBLOCK;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(mapAddressToRange(address, MachineType:L3Cache,
+                          l3_select_low_bit, l3_select_num_bits, intToID(0)));
+      out_msg.MessageSize := MessageSizeType:Response_Control;
+      DPRINTF(RubySlicc, "@@L2-L2unblockL3Network_out Addr: %#x State: %s Sender: %s Type: %s Destination: %s\n",
+                out_msg.addr, getState(tbe, cache_entry, out_msg.addr),
+                out_msg.Sender, out_msg.Type, out_msg.Destination);
+      //DPRINTF(RubySlicc, "%#x\n", address);
+    }
+  }
+
+  action(k_popL1RequestQueue, "k", desc="Pop L1 request Queue queue.") {
+    L1requestL2Network_in.dequeue(clockEdge());
+  }
+
+  action(kd_wakeUpDependents, "kd", desc="wake-up dependents") {      // the function of this action is to wakeup previous stalled msg
+    wakeUpAllBuffers(address);
+  }
+
+  action(l_popL3RequestQueue, "l",
+         desc="Pop incoming request queue and profile the delay within this virtual network") {
+    Tick delay := L3requestL2Network_in.dequeue(clockEdge());
+    profileMsgDelay(2, ticksToCycles(delay));
+  }
+  
+  action(o_popL1ResponseQueue, "o1",
+         desc="Pop Incoming Response queue and profile the delay within this virtual network") {
+    Tick delay := L1responseL2Network_in.dequeue(clockEdge());
+    profileMsgDelay(1, ticksToCycles(delay));
+  }
+
+  action(o_popL2L3ResponseQueue, "o23",
+         desc="Pop Incoming Response queue and profile the delay within this virtual network") {
+    Tick delay := L3L2responseL2Network_in.dequeue(clockEdge());
+    profileMsgDelay(1, ticksToCycles(delay));
+  }
+
+  action(oo_allocateCacheBlock, "\o", desc="Set cache tag equal to tag of block B.") {
+    if (is_invalid(cache_entry)) {
+      set_cache_entry(L2cache.allocate(address, new Entry));
+    }
+  }
+
+  action(s_deallocateTBE, "s", desc="Deallocate TBE") {
+    TBEs.deallocate(address);
+    unset_tbe();
+  }
+
+  action(u_writeDataFromL1Response, "uresl1", desc="Write L1 data from response port to L2 cache") {
+    peek(L1responseL2Network_in, ResponseMsg) {
+      assert(is_valid(cache_entry));
+      if (in_msg.Dirty) {
+          cache_entry.DataBlk := in_msg.DataBlk;
+          cache_entry.Dirty := in_msg.Dirty;
+          DPRINTF(RubySlicc, "@@L1 data is dirty!");
+      }
+    }
+  }
+
+  // this is especially designed for PUTX msg, PUTX msg is a req msg from L1 to L2, the req msg also carries
+  // data that L1 wants to send to L2
+  action(u_writeDataFromL1Request, "ureql1", desc="Write L1 data from request port to L2 cache") {
+    peek(L1requestL2Network_in, RequestMsg) {
+      assert(is_valid(cache_entry));
+      if (in_msg.Dirty) {
+          DPRINTF(RubySlicc, "@@u_writeDataFromL1Request  Addr: %#x Requestor: %s Type: %s Old data: %s Dirty: %s\n",
+                in_msg.addr, in_msg.Requestor, cache_entry.DataBlk, in_msg.Dirty);
+          cache_entry.DataBlk := in_msg.DataBlk;
+          cache_entry.Dirty := in_msg.Dirty;
+          DPRINTF(RubySlicc, "@@u_writeDataFromL1Request  Addr: %#x Requestor: %s Type: %s New data: %s Dirty: %s\n",
+                in_msg.addr, in_msg.Requestor, cache_entry.DataBlk, in_msg.Dirty);
+      }
+    }
+  }
+
+  action(u_writeDataFromL3Response, "uresl3", desc="Write data from L3 to L2") {
+    peek(L3L2responseL2Network_in, ResponseMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.DataBlk := in_msg.DataBlk;
+      cache_entry.Dirty := in_msg.Dirty;
+    }
+  }
+
+  action(u_writeDataFromL2ToL2, "uresl2", desc="Write data from other L2 to this L2 (this L2 will soon become the new owner)") {
+    peek(L3L2responseL2Network_in, ResponseMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.DataBlk := in_msg.DataBlk;
+      cache_entry.Dirty := in_msg.Dirty;
+    }
+  }
+
+  action(uu_profileHit, "\uh", desc="Profile the demand hit") {
+    L2cache.profileDemandHit();
+  }
+
+  action(uu_profileMiss, "\um", desc="Profile the demand miss") {
+    L2cache.profileDemandMiss();
+  
+  }
+
+  action(z1_stallAndWaitL1Queue, "\z1", desc="recycle L1 request queue") {
+    stall_and_wait(L1requestL2Network_in, address);
+  }
+
+  // action(z2_stallAndWaitL1RespQueue, "\z2", desc="recycle resp queue") {
+  //   stall_and_wait(L1responseL2Network_in, address);
+  // }
+
+  // action(z4_stallAndWaitL2L3RespQueue, "\z4", desc="recycle resp queue") {
+  //   stall_and_wait(L3L2responseL2Network_in, address);
+  // }
+
+  action(z3_stallAndWaitL3Queue, "\z3", desc="recycle L3 request queue") {
+    stall_and_wait(L3requestL2Network_in, address);
+  }
+
+  // action(zz_showNextMsgInL3reqL2Buffer,"zz", desc="show next msg in L3requestL2Network_in") {
+  //   peek(L1requestL2Network_in, RequestMsg) {
+  //     DPRINTF(RubySlicc, "@@Next msg in L3L2L1responseNetwork_in, Addr %#x Type %s Sender %s", in_msg.addr, in_msg.Type, in_msg.Requestor);
+  //   }
+  // }
+  // **********************************************TRANSITIONS******************************************** //
+  
+  transition({IS, IM, IS_I, Inst_IS, MI, SINK_WB_ACK, M_IL1, MM_IL1},
+             {Load, Store, Ifetch, L2_Replacement}) {
+    z1_stallAndWaitL1Queue;
+  }
+
+  transition({IS, IM, Inst_IS}, L1_PUTX) {
+    fj_sendWBAckToL1Req;
+    k_popL1RequestQueue;
+  }
+
+  ////**** TODO not sure about this
+  transition({IS, Inst_IS}, L1_Ack_MI_I) {
+    o_popL1ResponseQueue;
+  }
+  
+  // Transitions from Idle
+
+  transition(I, Load, IS) {    // EVENT Load is triggered by msg from L1
+                               // when L1 receives CPU INSTR but at state I, it will send GETS to L2
+    oo_allocateCacheBlock;
+    i_allocateTBE;
+    aa_issueGETS;   // L2 also miss, need to send GETS req to L3
+    uu_profileMiss;
+    k_popL1RequestQueue;
+  }
+
+   transition(I, Ifetch, Inst_IS) {       
+    oo_allocateCacheBlock;
+    i_allocateTBE;
+    ab_issueGET_INSTR;   
+    uu_profileMiss;
+    k_popL1RequestQueue;
+  }
+
+  transition(I, Store, IM) {
+    oo_allocateCacheBlock;
+    i_allocateTBE;
+    b_issueGETX;
+    uu_profileMiss;
+    k_popL1RequestQueue;
+  }
+
+  
+  // ////**** TODO don't know whether this is correct
+  // // when L2 become MI, it already receives data from L1
+  // // so data transfer it not needed at this time 
+  // transition(MI, L1_PUTX) {
+  //   fj_sendWBAckToL1Req;             // in this case, this is not a invalidation ack, since L2 is still MI
+  //                                     // this just aims to tell L1 that it can transfer to next state
+  //   k_popL1RequestQueue;
+  // }
+
+  ////**** TODO I add this, can't guarantee the correction
+  transition({I, MM, MI}, L1_PUTX) {
+    fj_sendWBAckToL1Req;
+    k_popL1RequestQueue;
+  }
+
+  transition(I, Inv) {   // L3 sends INV msg to L2, the block is not in L1, so simply invalidate L2
+    fi_sendInvAckToL3;
+    l_popL3RequestQueue;
+  }
+  
+  // Transitions from Modified
+
+  transition(MM, L2_Replacement, MI) {    // block in L2 not in L1, thus when replace L2, there's nothing to do with L1
+    i_allocateTBE;
+    g_issuePUTX;   // send data, but hold in case forwarded request
+    ff_deallocateCacheBlock;
+  }
+
+  transition(M, L1_PUTX, MM) {   // when L1 need to perform a replacement, L1 send PUTX to L2
+                                   // when L1 sends msg PUTX, L2 will trigger WriteBack event
+    u_writeDataFromL1Request;      // at the same time, send ack to L1
+    fj_sendWBAckToL1Req;
+    k_popL1RequestQueue;           // data no longer in L1 now
+  }
+  
+  ////**** TODO I add this trnasition, not sure whether it is correct
+  transition(M, Data_fromL1, MM) {   
+    u_writeDataFromL1Response;
+    o_popL1ResponseQueue;           // data no longer in L1 now
+  }
+
+  transition(M, L1_DataAck, MM) {
+    u_writeDataFromL1Response;
+    o_popL1ResponseQueue;
+  }
+
+  transition(MM, L1_DataAck) {
+    o_popL1ResponseQueue;
+  }
+
+  transition(MM, Inv, I) {   // block in L2 not in L1, so invalidate it bhas nothing to do with L1
+    f_sendDataToL3;          // data need to be send to L3 before invalidation
+    ff_deallocateCacheBlock;
+    l_popL3RequestQueue;
+  }
+
+  ////**** TODO cant gurantee the correction
+  transition({I, MM, MI, SINK_WB_ACK, M, IM}, {L1_Ack, L1_Ack_MI_I}) {
+    o_popL1ResponseQueue;
+  }
+
+  transition(MI, WB_Ack, I) {    // WB_Ack from L3
+    s_deallocateTBE;
+    o_popL2L3ResponseQueue;
+    ff_deallocateCacheBlock;
+    kd_wakeUpDependents;
+  }
+
+  // ////**** TODO dont know whether the following two are corrrect
+  // transition(MI, L1_DataAck) {
+  //   z2_stallAndWaitRespQueue;
+  // }
+  ////**** TODO cant guarantee the correction
+  transition(MI, L1_DataAck) {
+    o_popL1ResponseQueue;
+  }
+
+  // transition(I, L1_DataAck) {
+  //   z2_stallAndWaitRespQueue;
+  // }
+  // ////****
+
+  transition(MI, Inv, SINK_WB_ACK) {  // when replacing, receiving an invalidation
+    ft_sendDataToL3_fromTBE;  // becuase in transient state, data should be obtained from tbe
+    l_popL3RequestQueue;
+  }
+
+  // when L3 sends GETX to L2, L2 triggers event Fwd_GETX
+  // which means when L2 sends GETX to L3, L2 will eventually trigger Fwd event (which means other core has the data)
+  // L2 send GETX to L3 when L1 and L2 miss in CPU instruction
+  // when L3 do sent GETX to L2, it means L3 is sure about there's valid data in other L2 cache
+  // which means when L2 triggers Fwd event, it is guaranteed there's valid data in other L2 cache
+
+  transition(MM, {Fwd_GETS, Fwd_GET_INSTR}, I) {    // other core needs the data
+    d_sendDataToRequestor;
+    f_sendDataToL3;
+    ff_deallocateCacheBlock;
+    l_popL3RequestQueue;
+    // kd_wakeUpDependents;
+  }
+
+  transition(MM, Fwd_GETX, I) {    // other core needs the data
+    d_sendDataToRequestor;
+    //f_sendDataToL3;
+    ff_deallocateCacheBlock;
+    l_popL3RequestQueue;
+    // kd_wakeUpDependents;
+  }
+
+  transition(M, L1_Invalidate_Own, M_IL1) {    // block is in both L1 and L2
+    forward_eviction_to_L1_own;                // block in L2 should be replaced, but there's copy in L1,
+                                               // we need to invalidate it first
+  }
+
+  transition(M, L1_Invalidate_Else, M_IL1) {
+    forward_eviction_to_L1_else;
+  }
+
+//*******************WT**********************//
+  transition(M, L1_StoreData) {     //L1 hit, L2 data update as well
+    u_writeDataFromL1Request;
+    k_popL1RequestQueue;
+  }
+
+  transition(M, L1I_StoreData, MM) {
+    u_writeDataFromL1Request;
+    fj_sendWBAckToL1Req;
+    k_popL1RequestQueue;
+  }
+
+  transition({I, M_IL1, MI, SINK_WB_ACK}, L1_StoreData) {
+    k_popL1RequestQueue;
+  }
+
+  transition(M_IL1, L1I_StoreData, MM) {
+    u_writeDataFromL1Request;
+    fj_sendWBAckToL1Req;
+    k_popL1RequestQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(IM, Data, Ma) {    // L1 must be Invalid
+    u_writeDataFromL3Response;
+    h_data_to_l1;        // send data to L1
+    j_sendUnblock;
+    s_deallocateTBE;
+    o_popL2L3ResponseQueue;
+    //kd_wakeUpDependents;
+  }
+
+  transition(Ma, L2_Replacement) {
+    z1_stallAndWaitL1Queue;
+  }
+  
+  transition(Ma, Inv) {
+    z3_stallAndWaitL3Queue;
+  }
+
+  transition(Ma, L1_PUTX) {
+    k_popL1RequestQueue;
+  }
+
+  transition(Ma, L1I_StoreData, MM) {
+    u_writeDataFromL1Request;
+    fj_sendWBAckToL1Req;
+    k_popL1RequestQueue;
+    kd_wakeUpDependents;
+  }
+
+  //*****************WT**********************//
+
+  transition(MI, {Fwd_GETS, Fwd_GET_INSTR}, SINK_WB_ACK) {    // this cache is still responsible for providing data
+    dt_sendDataToRequestor_fromTBE;
+    ft_sendDataToL3_fromTBE;
+    l_popL3RequestQueue;
+  }
+
+  transition(MI, Fwd_GETX, SINK_WB_ACK) {    // this cache is still responsible for providing data
+    dt_sendDataToRequestor_fromTBE;
+    //f_sendDataToL3;
+    l_popL3RequestQueue;
+  }
+
+  // Transitions from IS
+  transition({IS, Inst_IS, IS_I}, Inv, IS_I) {
+    fi_sendInvAckToL3;
+    l_popL3RequestQueue;
+  }
+
+  transition({IS, Inst_IS}, Data, M) {
+    u_writeDataFromL3Response;
+    h_data_to_l1;        // send data to L1
+    j_sendUnblock;
+    s_deallocateTBE;
+    o_popL2L3ResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(IS_I, Data, I) {   // data comes, but already receives invalidation
+    u_writeDataFromL3Response;   // write data from L3 to L2       ////**** TODO whether we need to send UNBLOCK 
+    h_stale_data_to_l1;
+    s_deallocateTBE;
+    ff_deallocateCacheBlock;
+    o_popL2L3ResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+//*********************** relate to DataS_fromL2 ************************
+  transition(IS, DataS_fromL2, M) {
+    u_writeDataFromL2ToL2;
+    j_sendUnblock;
+    h_data_to_l1;
+    s_deallocateTBE;
+    o_popL2L3ResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(Inst_IS, DataS_fromL2, M) {
+    u_writeDataFromL2ToL2;
+    j_sendUnblock;
+    h_data_to_l1;
+    s_deallocateTBE;
+    o_popL2L3ResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(IS_I, DataS_fromL2, I) {
+    u_writeDataFromL2ToL2;
+    j_sendUnblock;
+    h_stale_data_to_l1;
+    s_deallocateTBE;
+    ff_deallocateCacheBlock;
+    o_popL2L3ResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+
+//***********************************************************************
+
+  transition(IM, Inv) {
+    fi_sendInvAckToL3;
+    l_popL3RequestQueue;
+  }
+
+  transition(SINK_WB_ACK, Inv){   // MI->SINK_WB_ACK
+    fi_sendInvAckToL3;
+    l_popL3RequestQueue;
+  }
+  
+  ////**** TODO cant guarantee the correction
+  transition(SINK_WB_ACK, L1_DataAck) {
+
+  }
+
+  transition(I, L1_DataAck) {
+    o_popL1ResponseQueue;
+  }
+
+  transition(SINK_WB_ACK, WB_Ack, I){    // WB_Ack is from L3, informing L2 that it receives data
+    s_deallocateTBE;
+    o_popL2L3ResponseQueue;
+    ff_deallocateCacheBlock;
+    kd_wakeUpDependents;
+  }
+
+  ////**** TODO I add this, not sure about it's correction
+  transition(SINK_WB_ACK, L1_PUTX) {
+    z1_stallAndWaitL1Queue;
+  }
+
+  ////**** TODO I add MM_IL1->WB->MM_IL1 here, not sure whether this makes sense
+  transition({M_IL1,MM_IL1}, L1_PUTX, MM_IL1) {   // L1 receives INV but hasn't resp yet
+                                           // L1 doesn't have data anymore
+    u_writeDataFromL1Request;              // write L1 data into L2
+    fj_sendWBAckToL1Req;
+    k_popL1RequestQueue;
+    kd_wakeUpDependents;              ////***** TODO should this code exist?
+  }
+
+  ////**** TODO I add this whole transition in order to solve the "data from L1 resp" problem
+  transition({M_IL1,MM_IL1}, Data_fromL1, MM_IL1) {   // L1 receives INV but hasn't resp yet
+                                           // L1 doesn't have data anymore
+    u_writeDataFromL1Response;              // write L1 data into L2
+    //fj_sendWBAckToL1Req;                      ////**** TODO I add this, when L2 receives data from L1, it should sent ACK to it
+    o_popL1ResponseQueue;
+    kd_wakeUpDependents;               ////***** TODO should this code exist?
+  }
+
+
+  
+  ////**** TODO I don't know whether MM_IL1->L1_DataAck->MM should update data in L2(futher discussion see in debug log p7)
+  transition(M_IL1, L1_DataAck, MM) {     // L1 tells L2 that it transfer to I state and sends data to L2
+    u_writeDataFromL1Response;     // L2 receives the data L1 sends
+    fk_sendInvAckToL1Resp;
+
+    //fl_sendL2ValidToL3Req;
+
+    o_popL1ResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(MM_IL1, L1_DataAck, MM) { // MM_IL1 already has data yet, so no ack need to be send to L1
+    u_writeDataFromL1Response;     
+    o_popL1ResponseQueue;
+    kd_wakeUpDependents;
+    //zz_showNextMsgInL3reqL2Buffer;
+  }
+
+  transition({M_IL1, MM_IL1}, L1_Ack, MM) {    // L1 tells L2 that it transfer to I state, but no data need to send
+    o_popL1ResponseQueue;
+    kd_wakeUpDependents;
+  }
+  
+  ////**** TODO two following: cannot gurantee the correction
+  transition(MM_IL1, L1_Ack_MI_I, MM) {    // L1 tells L2 that it transfer to I state, but no data need to send
+    o_popL1ResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(M_IL1, L1_Ack_MI_I) {    // L2 state dont change because L1_Ack_MI_I is not pragmatical, this ack should be stale 
+    o_popL1ResponseQueue;
+  }
+  
+  transition(M_IL1, L1_Invalidate_Own) {  // L1 already receives INV from L2, L2 shoots another INV, then L1 stalls
+    z1_stallAndWaitL1Queue;               // the msg need to wait in the input port connecting to L1
+  }
+
+  transition(M_IL1, L1_Invalidate_Else) {   // INV from L3 
+    z3_stallAndWaitL3Queue;
+  }
+
+  // L1 is invaliding, but L2 is still valid, when there's requests, stall is of neccessity
+  transition({M_IL1, MM_IL1}, {Inv, Fwd_GETX, Fwd_GETS, Fwd_GET_INSTR}) {
+    z3_stallAndWaitL3Queue;
+  }
+
+  transition({MM,M}, {Load, Ifetch, Store}, M) {   // L2 hits, whether L1 hits or not, L2 will copy data to L1
+                                                   // MM -> store -> Mblock initially not in L1, but in L2, when a Store comes,
+                                                   // L1 miss and L2 hit,
+    h_data_to_l1;
+    uu_profileHit;
+    k_popL1RequestQueue;
+    //kd_wakeUpDependents;
+  }
+  
+  // in M state, data in L1 and L2 is not neccessarily the same
+  // triggered by PUTX_COPY from L1 
+  transition(M, L1_DataCopy){
+    u_writeDataFromL1Response;
+    k_popL1RequestQueue;
+  }
+  
+  transition(M_IL1, L1_DataCopy){
+    u_writeDataFromL1Response;
+    k_popL1RequestQueue;
+  }
+
+  // triggerd by NAK from L1
+  // L1 invalidate its modofied line
+  transition(M_IL1, L1_DataNak, MM) {
+    k_popL1RequestQueue;
+    kd_wakeUpDependents;    ////****TODO // when to use this? why some transition needs this but some not?
+  } 
+
+  transition(I, L2_Replacement) {
+    ff_deallocateCacheBlock;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+

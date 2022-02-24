@@ -1,0 +1,418 @@
+machine(MachineType:Directory, "MI Directory")
+ : DirectoryMemory * directory;
+   Cycles to_mem_ctrl_latency := 1;
+   Cycles directory_latency := 6;
+
+   bool enable_prefetch := "True";
+
+   MessageBuffer * requestToDir, network="From", virtual_network="0",
+        vnet_type="request";
+   MessageBuffer * responseToDir, network="From", virtual_network="1",
+        vnet_type="response";
+   // dir doesn't need to send req
+   MessageBuffer * responseFromDir, network="To", virtual_network="1",
+        vnet_type="response";
+
+   MessageBuffer * requestToMemory;
+   MessageBuffer * responseFromMemory;
+{
+  // ***********************************************STATES******************************************* //
+  state_declaration(State, desc="Directory states", default="Directory_State_I") {
+    // Base states
+    I, AccessPermission:Read_Write, desc="dir is the owner and memory is up-to-date, all other copies are Invalid";
+    // Dir is responsible for providing data
+    // ID, AccessPermission:Busy, desc="Intermediate state for DMA_READ when in I";
+    // ID_W, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in I";
+    
+    // the state indicates mem copy
+    M, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
+
+    IM, AccessPermission:Busy, desc="Intermediate State I>M";
+    MI, AccessPermission:Busy, desc="Intermediate State M>I";
+   /*  M_DRD, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
+    M_DRDI, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
+    M_DWR, AccessPermission:Busy, desc="Intermediate State when there is a dma write";
+    M_DWRI, AccessPermission:Busy, desc="Intermediate State when there is a dma write"; */
+  }
+
+   // *********************************************Events******************************************* //
+  enumeration(Event, desc="Directory events") {
+    Fetch, desc="A memory fetch arrives";
+    // PF_Fetch, desc="A memory prefetch arrives";
+    Data, desc="writeback data arrives";
+    Memory_Data, desc="Fetched data from memory arrives";
+    Memory_Ack, desc="Writeback Ack from memory arrives";
+    //added by SS for dma
+    //DMA_READ, desc="A DMA Read memory request";
+    //DMA_WRITE, desc="A DMA Write memory request";
+    CleanReplacement, desc="Clean Replacement in L3 cache";
+  }
+
+  // **********************************************TYPES******************************************** //
+  
+  // only dir has directory entry, this directory entry has a member "Owner"
+  // L3 directory entry has a member which has the same fucntion with Owner
+  // DirectoryEntry
+  structure(Entry, desc="...", interface="AbstractCacheEntry", main="false") {
+    State DirectoryState,          desc="Directory state";
+    MachineID Owner;
+  }
+
+  // TBE entries for DMA requests
+  structure(TBE, desc="TBE entries for outstanding DMA requests") {
+    Addr PhysicalAddress, desc="physical address";
+    State TBEState,        desc="Transient State";
+    DataBlock DataBlk,     desc="Data to be written (DMA write only)";
+    int Len,               desc="...";
+    //MachineID Requestor,   desc="The DMA engine that sent the request";
+    // we don't need a cache req, because L3 is the only cache 
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+    bool functionalRead(Packet *pkt);
+    int functionalWrite(Packet *pkt);
+  }
+
+  TBETable TBEs, template="<Directory_TBE>", constructor="m_number_of_TBEs";
+
+  Tick clockEdge();
+  Tick cyclesToTicks(Cycles c);
+  void set_tbe(TBE tbe);
+  void unset_tbe();
+  void wakeUpBuffers(Addr a);
+
+  Entry getDirectoryEntry(Addr addr), return_by_pointer="yes" {
+    Entry dir_entry := static_cast(Entry, "pointer", directory[addr]);
+
+    if (is_valid(dir_entry)) {
+      return dir_entry;
+    }
+
+    dir_entry :=  static_cast(Entry, "pointer",
+                              directory.allocate(addr, new Entry));
+    return dir_entry;
+  }
+  
+  State getState(TBE tbe, Addr addr) {
+    if (is_valid(tbe)) {
+      //DPRINTF(RubySlicc,"@@In getState function in Dir.sm, tbe is available, the reuturning state is tbe's state\n");
+      return tbe.TBEState;
+    } else if (directory.isPresent(addr)) {
+      //DPRINTF(RubySlicc,"@@In getState function in Dir.sm, tbe is unavailable, the reuturning state is DirectoryEntry's state\n");
+      return getDirectoryEntry(addr).DirectoryState;
+    } else {
+      return State:I;
+    }
+  }
+  
+  void setState(TBE tbe, Addr addr, State state) {
+    if (is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+
+    if (directory.isPresent(addr)) {
+      getDirectoryEntry(addr).DirectoryState := state;
+    }
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      DPRINTF(RubySlicc, "%s\n", Directory_State_to_permission(tbe.TBEState));
+      return Directory_State_to_permission(tbe.TBEState);
+    }
+
+    if(directory.isPresent(addr)) {
+      DPRINTF(RubySlicc, "%s\n", Directory_State_to_permission(getDirectoryEntry(addr).DirectoryState));
+      return Directory_State_to_permission(getDirectoryEntry(addr).DirectoryState);
+    }
+
+    DPRINTF(RubySlicc, "%s\n", AccessPermission:NotPresent);
+    return AccessPermission:NotPresent;
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else {
+      functionalMemoryRead(pkt);
+    }
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+        testAndWrite(addr, tbe.DataBlk, pkt);
+    }
+
+    num_functional_writes := num_functional_writes + functionalMemoryWrite(pkt);
+    return num_functional_writes;
+  }
+
+  void setAccessPermission(Addr addr, State state) {
+    if (directory.isPresent(addr)) {
+      getDirectoryEntry(addr).changePermission(Directory_State_to_permission(state));
+    }
+  }
+
+  bool isGETRequest(CoherenceRequestType type) {
+    return (type == CoherenceRequestType:GETS) ||
+      (type == CoherenceRequestType:GET_INSTR) ||
+      (type == CoherenceRequestType:GETX);
+  }
+
+  // ***********************************PORT********************************* //
+  out_port(responseNetwork_out, ResponseMsg, responseFromDir);
+  out_port(memQueue_out, MemoryMsg, requestToMemory);
+
+  in_port(requestNetwork_in, RequestMsg, requestToDir, rank = 0) {
+    if (requestNetwork_in.isReady(clockEdge())) {
+      peek(requestNetwork_in, RequestMsg) {
+        DPRINTF(RubySlicc, "@Dir-requestNetwork_in Addr: %#x State: %s Requestor: %s Type: %s Destination: %s\n",
+                in_msg.addr, getState(TBEs[in_msg.addr], in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+      
+        assert(in_msg.Destination.isElement(machineID));
+
+        if (isGETRequest(in_msg.Type)) {
+          trigger(Event:Fetch, in_msg.addr, TBEs[in_msg.addr]);
+        } 
+        // // else if (in_msg.Type == CoherenceRequestType:PF_GETS) {
+        // //   trigger(Event:PF_Fetch, makeLineAddress(in_msg.addr),
+        // //           TBEs[makeLineAddress(in_msg.addr)]);
+        // // } /* else if (in_msg.Type == CoherenceRequestType:DMA_WRITE) {
+        //   trigger(Event:DMA_WRITE, makeLineAddress(in_msg.addr),
+        //           TBEs[makeLineAddress(in_msg.addr)]);
+        // } */ 
+        else {
+          DPRINTF(RubySlicc, "%s\n", in_msg);
+          error("Invalid message");
+        }
+
+        DPRINTF(RubySlicc, "@Dir-requestNetwork_in Addr: %#x Next State: %s\n",
+                in_msg.addr, getState(TBEs[in_msg.addr], in_msg.addr));
+
+      }
+    }
+  }
+  
+  // L3 resp to Dir
+  in_port(responseNetwork_in, ResponseMsg, responseToDir, rank = 1) {
+    if (responseNetwork_in.isReady(clockEdge())) {
+      peek(responseNetwork_in, ResponseMsg) {
+        assert(in_msg.Destination.isElement(machineID));
+
+        DPRINTF(RubySlicc, "@Dir-responseNetwork_in Addr: %#x State: %s Sender: %s Type: %s Destination: %s\n",
+                in_msg.addr, getState(TBEs[in_msg.addr], in_msg.addr),
+                in_msg.Sender, in_msg.Type, in_msg.Destination);
+
+        if (in_msg.Type == CoherenceResponseType:MEMORY_DATA) {  // L3 wanna to have mem data
+          trigger(Event:Data, in_msg.addr, TBEs[in_msg.addr]);
+        } else if (in_msg.Type == CoherenceResponseType:ACK) {   // L3 sends dir ACK, which means a clean replacement
+          trigger(Event:CleanReplacement, in_msg.addr, TBEs[in_msg.addr]);
+        } else {
+          DPRINTF(RubySlicc, "%s\n", in_msg.Type);
+          error("Invalid message");
+        }
+
+        DPRINTF(RubySlicc, "@Dir-responseNetwork_in Addr: %#x Next State: %s\n",
+                in_msg.addr, getState(TBEs[in_msg.addr], in_msg.addr));
+      }
+    }
+  }
+  
+  // mem resp to Dir
+  in_port(memQueue_in, MemoryMsg, responseFromMemory, rank = 2) {
+    if (memQueue_in.isReady(clockEdge())) {
+      peek(memQueue_in, MemoryMsg) {
+        DPRINTF(RubySlicc, "@Dir-memQueue_in Addr: %#x State: %s Sender: Memory Type: %s\n",
+              in_msg.addr, getState(TBEs[in_msg.addr], in_msg.addr),in_msg.Type);
+
+        if (in_msg.Type == MemoryRequestType:MEMORY_READ) {     // mem sends mem_read to dir
+          trigger(Event:Memory_Data, in_msg.addr, TBEs[in_msg.addr]);
+        } else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
+          trigger(Event:Memory_Ack, in_msg.addr, TBEs[in_msg.addr]);
+        } else {
+          DPRINTF(RubySlicc, "%s\n", in_msg.Type);
+          error("Invalid message");
+        }
+
+        DPRINTF(RubySlicc, "@Dir-memQueue_in Addr: %#x Next State: %s\n",
+              in_msg.addr, getState(TBEs[in_msg.addr], in_msg.addr));
+      }
+    }
+  }
+
+  // ****************************************ACTIONS************************************* //
+  
+  action(a_sendAck, "a", desc="Send ack to L3") {
+    peek(responseNetwork_in, ResponseMsg) {    // L3 response to Dir 
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {   // Mem sends L3 msg that it already changed to I state(no data transfer is needed because of clean_replacement)
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:MEMORY_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
+  }
+
+  action(aa_sendAck, "aa", desc="Send ack to L3") {
+    peek(memQueue_in, MemoryMsg) {    // L3 response to Dir 
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {   // Mem sends L3 msg that it receives data and changes to I state
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:MEMORY_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
+  }
+
+  action(d_sendData, "d", desc="Send data to requestor") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.addr := address;
+
+        // here is the only place isAllocateToL1L2 param is used
+        if (in_msg.Prefetch == PrefetchBit:Yes & in_msg.isAllocateToL1L2 == false)) {
+          out_msg.Type := CoherenceResponseType:NO_ALLOCATE_MEMORY_DATA;
+        } else {
+          // no prefetch, or prefetch at the same time sending data to L2
+          out_msg.Type := CoherenceResponseType:MEMORY_DATA;
+        }
+
+        out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.nth_Confirmation := in_msg.nth_Confirmation;
+        // out_msg.isAllocateToL1L2 := in_msg.isAllocateToL1L2;
+
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.Dirty := false;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+
+        Entry e := getDirectoryEntry(in_msg.addr);
+        e.Owner := in_msg.OriginalRequestorMachId;   // set the owner of the specific block
+      }
+    }
+  }
+
+  action(inv_sendCacheInvalidate, "inv", desc="Invalidate a cache block") {
+    peek(requestNetwork_in, RequestMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:INV;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(getDirectoryEntry(address).Owner);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
+  }
+
+  action(j_popIncomingRequestQueue, "j", desc="Pop incoming request queue") {
+    requestNetwork_in.dequeue(clockEdge());
+  }
+
+  action(k_popIncomingResponseQueue, "k", desc="Pop incoming request queue") {
+    responseNetwork_in.dequeue(clockEdge());
+  }
+
+  action(kd_wakeUpDependents, "kd", desc="wake-up dependents") {
+    wakeUpBuffers(address);
+  }
+
+  action(l_popMemQueue, "q", desc="Pop off-chip request queue") {
+    memQueue_in.dequeue(clockEdge());
+  }
+
+  action(qf_queueMemoryFetchRequest, "qf", desc="Queue off-chip fetch request") {
+    peek(requestNetwork_in, RequestMsg) {
+      enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+        out_msg.addr := address;
+        out_msg.Type := MemoryRequestType:MEMORY_READ;
+        out_msg.Sender := in_msg.Requestor;
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+        out_msg.Len := 0;
+
+        out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.isAllocateToL1L2 := in_msg.isAllocateToL1L2;
+        out_msg.nth_Confirmation := in_msg.nth_Confirmation;
+      }
+    }
+  }
+
+  action(qw_queueMemoryWBRequest, "qw", desc="Queue off-chip writeback request") {
+    peek(responseNetwork_in, ResponseMsg) {
+      enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+        out_msg.addr := address;
+        out_msg.Type := MemoryRequestType:MEMORY_WB;
+        out_msg.Sender := in_msg.Sender;
+        out_msg.MessageSize := MessageSizeType:Writeback_Data;
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.Len := 0;
+      }
+    }
+  }
+  
+  action(z_stallAndWaitRequest, "z", desc="recycle request queue") {
+    stall_and_wait(requestNetwork_in, address);
+  }
+
+  // **************************************TRANSITIONS*********************************** //
+
+  // fetch req from L3
+  // L3 send mem_read to mem
+  transition(I, Fetch, IM) {
+    qf_queueMemoryFetchRequest;
+    j_popIncomingRequestQueue;
+  }
+
+  // there is one core the owner, and other core wanna to be the owner
+  transition(M, Fetch) {
+    inv_sendCacheInvalidate;   // dir need to invalidate the owner first
+                               // because there's a lot to do with the INV, we need to stall 
+    z_stallAndWaitRequest;
+  }
+
+  transition(IM, Memory_Data, M) {
+    d_sendData;    // sends data to L3, telling that it's mem_data
+    l_popMemQueue;
+    kd_wakeUpDependents;   
+  }
+  
+  // L3 sends ACK to dir, indicating it's a clean replacement
+  transition(M, CleanReplacement, I) {   // the owner wanna replace
+    a_sendAck;              // send ACK to L3, inform it of the fact that mem changed it's state from M to I
+    k_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+  
+  // triggered by L3 response
+  // L3 responses to Dir with MEMORY_DATA, because L3 receives L3_Replacement/MEM_Inv
+  // Dir state is actually mem state
+  // L3 sends data to mem and relinguish ownership
+  transition(M, Data, MI) {
+    qw_queueMemoryWBRequest;
+    k_popIncomingResponseQueue;
+  }
+
+  // mem inform dir that it receives data
+  transition(MI, Memory_Ack, I) {
+    aa_sendAck;
+    l_popMemQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition({IM, MI}, {Fetch, Data} ) {
+    z_stallAndWaitRequest;
+  }
+}

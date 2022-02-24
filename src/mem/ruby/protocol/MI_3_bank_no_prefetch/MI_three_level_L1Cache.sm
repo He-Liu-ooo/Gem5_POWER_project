@@ -1,0 +1,1030 @@
+machine(MachineType:L1Cache, "MI Directory L1 Cache")
+ : Sequencer * sequencer;
+   CacheMemory * L1Icache;
+   CacheMemory * L1Dcache;
+   Cycles l1_request_latency := 2;
+   Cycles l1_response_latency := 2;
+   //RubyPrefetcher * prefetcher;
+   bool send_evictions;    // inform CPU of the eviciton
+   //bool enable_prefetch := "False";
+
+////****TODO // don't really understand the priority rank yet
+
+  // L1 -> req -> L2
+  MessageBuffer * requestFromL1Cache, network="To",
+        vnet_type="request";
+
+  // L1 -> resp -> L2
+  MessageBuffer * responseFromL1Cache, network="To",
+        vnet_type="response";
+
+  // L2 -> req -> L1
+  MessageBuffer * requestToL1Cache, network="From",
+        vnet_type="request";
+
+  // L2 -> resp -> L1
+  MessageBuffer * responseToL1Cache, network="From",
+        vnet_type="response";
+
+  MessageBuffer * mandatoryQueue;
+
+{
+  // ***********************************STATES***********************************//
+  ////****TODO // whether need to add or remove states from below?
+  state_declaration(State, desc="L1 Cache states") {
+    //Base states
+    I, AccessPermission:Invalid, desc="Not Present/Invalid";
+    M, AccessPermission:Read_Write, desc="Modified";
+
+    //MII, AccessPermission:Busy, desc="Modified, issued PUTX, received nack";  
+    // when PUT, M->MI, at the same time Dir receive GETX:
+    // 1. if Dir send Fwd_GETX first, MI->II, then Dir send WB_Nack, II->I
+    // 2. if Dir send WB_Nack first, MI->MII, this block is still the owner, then Dir send Fwd_GETX, MII->I */
+
+    // Transient states
+    II, AccessPermission:Busy, desc="Not Present/Invalid, issued PUT";
+    MI, AccessPermission:Busy, desc="Modified, issued PUT";   
+    ////****TODO // not sure if above states are needed
+
+    IS, AccessPermission:Busy, desc="Issued request for LOAD";
+    Inst_IS, AccessPermission:Busy, desc="Issued request for Ifetch";
+    //IM, AccessPermission:Busy, desc="Issued request for STORE";
+    Ia, AccessPermission:Busy, desc="L1 gets new data from L2, update it and sends it back to L2";
+    Iaa, AccessPermission:Busy, desc="Waiting for L2's getting data to transfer to I";
+  }
+
+  // ************************************EVENTS*********************************//
+  enumeration(Event, desc="L1 Cache events") {
+    // From processor
+    Load,       desc="Load request from processor";
+    Ifetch,     desc="Ifetch request from processor";
+    Store,      desc="Store request from processor";
+
+    // Invalidation from L2 (self or other)
+    InvOwn,          desc="Invalidate request from own L2";
+    InvElse,         desc="Invalidate request from other's L2 ";
+
+    // Internal request
+    L1_Replacement,  desc="Replace a block in L1Cache";
+
+    // Requests from other processor
+    Fwd_GETX,        desc="Forward Store requirement";
+    Fwd_GETS,   desc="Forward Load requirement";
+    Fwd_GET_INSTR,   desc="Forward Ifetch requirement";
+
+    // Data from L2 cache
+    Data,       desc="Data for CPU";
+    //Inv,        desc="Invalidate request from L2";
+    Writeback_Ack,   desc="Ack from the L2 for a writeback";
+    //Ack,   desc="Ack for processor";  ////****TODO  // do we need this?   tells the sender that this cache is already in I state?
+  }
+
+  // ************************************TYPES*********************************//
+  enumeration(RequestType, desc="To communicate stats from transitions to recordStats") {
+    L1DCacheDataArrayRead,     desc="Read the data array";
+    L1DCacheDataArrayWrite,    desc="Write the data array";
+    L1DCacheTagArrayRead,      desc="Read the tag array";
+    L1DCacheTagArrayWrite,     desc="Write the tag array";
+  }
+
+  // *******************************STRUCTURE DEFINE***************************//
+  // CacheEntry
+  structure(Entry, desc="...", interface="AbstractCacheEntry" ) {
+    State CacheState,        desc="cache state";
+    DataBlock DataBlk,       desc="data for the block";
+    bool Dirty, default="false",   desc="data is dirty";
+  }
+
+  // TBE fields
+  structure(TBE, desc="...") {
+    Addr addr,              desc="Physical address for this TBE";
+    State TBEState,        desc="Transient state";
+    DataBlock DataBlk,                desc="Buffer for the data block";
+    bool Dirty, default="false",   desc="data is dirty";
+    //int pendingAcks, default="0", desc="number of pending acks";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+   TBETable TBEs, template="<L1Cache_TBE>", constructor="m_number_of_TBEs";
+
+   Tick clockEdge();
+   Cycles ticksToCycles(Tick t);
+   void set_cache_entry(AbstractCacheEntry a);
+   void unset_cache_entry();
+   void set_tbe(TBE a);
+   void unset_tbe();
+   //void wakeUpBuffers(Addr a);
+   void wakeUpAllBuffers(Addr a);
+   void profileMsgDelay(int virtualNetworkType, Cycles c);
+   //MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+
+  // **********************************FUNCTIONS******************************//
+
+  Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
+    Entry L1Dcache_entry := static_cast(Entry, "pointer", L1Dcache[addr]);
+    if(is_valid(L1Dcache_entry)) {
+      return L1Dcache_entry;
+    }
+
+    Entry L1Icache_entry := static_cast(Entry, "pointer", L1Icache[addr]);
+    DPRINTF(RubySlicc, "L1Icache entry is valid for addr:%#x", addr);
+    return L1Icache_entry;
+  }
+
+  Entry getL1DCacheEntry(Addr addr), return_by_pointer="yes" {
+    Entry L1Dcache_entry := static_cast(Entry, "pointer", L1Dcache[addr]);
+    return L1Dcache_entry;
+  }
+
+  Entry getL1ICacheEntry(Addr addr), return_by_pointer="yes" {
+    Entry L1Icache_entry := static_cast(Entry, "pointer", L1Icache[addr]);
+    return L1Icache_entry;
+  }
+
+  Event mandatory_request_type_to_event(RubyRequestType type) {
+   if (type == RubyRequestType:LD) {
+      return Event:Load;
+    } else if (type == RubyRequestType:IFETCH) {
+      return Event:Ifetch;
+    } else if ((type == RubyRequestType:ST) || (type == RubyRequestType:ATOMIC)) {
+      return Event:Store;
+    } else {
+      error("Invalid RubyRequestType");
+    }
+  } 
+
+  State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    assert((L1Dcache.isTagPresent(addr) && L1Icache.isTagPresent(addr)) == false);
+
+    if(is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    }
+    return State:I;
+  }
+
+////****TODO // seems that this is not used
+  void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+    assert((L1Dcache.isTagPresent(addr) && L1Icache.isTagPresent(addr)) == false);
+
+    // MUST CHANGE
+    if(is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+
+    if (is_valid(cache_entry)) {
+      cache_entry.CacheState := state;
+    }
+  }
+
+////****TODO // seems that this is not used
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      DPRINTF(RubySlicc, "%s\n", L1Cache_State_to_permission(tbe.TBEState));   // ME: this function means: you input the state, I return the corresponding permission
+      return L1Cache_State_to_permission(tbe.TBEState);
+    }
+
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(cache_entry)) {
+      DPRINTF(RubySlicc, "%s\n", L1Cache_State_to_permission(cache_entry.CacheState));
+      return L1Cache_State_to_permission(cache_entry.CacheState);
+    }
+
+    DPRINTF(RubySlicc, "%s\n", AccessPermission:NotPresent);
+    return AccessPermission:NotPresent;
+  }
+
+////****TODO // seems that this is not used
+  void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+    if (is_valid(cache_entry)) {
+      cache_entry.changePermission(L1Cache_State_to_permission(state));
+    }
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else {
+      testAndRead(addr, getCacheEntry(addr).DataBlk, pkt);
+    }
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+        testAndWrite(addr, tbe.DataBlk, pkt);
+      return num_functional_writes;
+    }
+
+    num_functional_writes := num_functional_writes +
+        testAndWrite(addr, getCacheEntry(addr).DataBlk, pkt);
+    return num_functional_writes;
+  }
+  
+  void recordRequestType(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:L1DCacheDataArrayRead) {
+      L1Dcache.recordRequestType(CacheRequestType:DataArrayWrite, addr);
+    } else if (request_type == RequestType:L1DCacheDataArrayWrite) {
+      L1Dcache.recordRequestType(CacheRequestType:DataArrayRead, addr);
+    } else if (request_type == RequestType:L1DCacheTagArrayRead) {
+      L1Dcache.recordRequestType(CacheRequestType:TagArrayRead, addr);
+    } else if (request_type == RequestType:L1DCacheTagArrayWrite) {
+      L1Dcache.recordRequestType(CacheRequestType:TagArrayWrite, addr);
+    }
+  }
+
+  bool checkResourceAvailable(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:L1DCacheDataArrayRead) {
+      return L1Dcache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:L1DCacheDataArrayWrite) {
+      return L1Dcache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:L1DCacheTagArrayRead) {
+      return L1Dcache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else if (request_type == RequestType:L1DCacheTagArrayWrite) {
+      return L1Dcache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else {
+      return true;
+    }
+  }
+
+  // ***************************************PORTS**********************************//
+  out_port(requestL1Network_out, RequestMsg, requestFromL1Cache);
+  out_port(responseL1Network_out, ResponseMsg, responseFromL1Cache);
+
+  ////****TODO // the rank is still a controversial issue
+  in_port(mandatoryQueue_in, RubyRequest, mandatoryQueue, desc="...", rank = 0) {
+    if (mandatoryQueue_in.isReady(clockEdge())) {
+      peek(mandatoryQueue_in, RubyRequest, block_on="LineAddress") {   // block_on="LineAddress", ensures that any other
+                                                                       // requests to the same cache line will be blocked
+                                                                       // until the current request is completed
+
+        // Check for data access to blocks in D-cache and ifetchs to blocks in I-cache
+        
+        
+        if (in_msg.Type == RubyRequestType:IFETCH) {
+          // ** INSTRUCTION ACCESS ***
+
+          Entry L1Icache_entry := getL1ICacheEntry(in_msg.LineAddress);
+          if (is_valid(L1Icache_entry)) { // if the addr the instrucion points to is valid
+            // The tag matches for the L1, so the L1 asks the L2 for it.
+            
+            DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Icache_entry valid Addr: %#x State: %s Sender: CPU Event: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress),mandatory_request_type_to_event(in_msg.Type));
+
+            trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress,
+                    L1Icache_entry, TBEs[in_msg.LineAddress]);
+
+            DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Addr: %#x Next State: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+
+          } else {   // ME: the instruction address's corresponding entry is invalid
+
+            // Check to see if it is in the OTHER L1
+            ////****TODO // ME: Why ICache invalid, we need to check the DCache?
+            Entry L1Dcache_entry := getL1DCacheEntry(in_msg.LineAddress);
+            if (is_valid(L1Dcache_entry)) {
+              // The block is in the wrong L1, put the request on the queue to the shared L2
+              ////****TODO // ME: why Dcache valid we need to replace
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Icache_entry invalid, Dcache_entry valid Addr: %#x State: %s Sender: CPU Type: L1_Replacement\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+
+              trigger(Event:L1_Replacement, in_msg.LineAddress,
+                      L1Dcache_entry, TBEs[in_msg.LineAddress]);
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Addr: %#x Next State: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+        
+            }
+
+            if (L1Icache.cacheAvail(in_msg.LineAddress)) {
+              // L1 does't have the line, but we have space for it
+              // in the L1 so let's see if the L2 has it.
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Icache_entry invalid but available Addr: %#x State: %s Sender: CPU Type: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress),mandatory_request_type_to_event(in_msg.Type));
+
+              trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress,
+                      L1Icache_entry, TBEs[in_msg.LineAddress]);   ////****TODO  // ME: but this code is exactly the same as the code when cache entry is valid?
+            
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Addr: %#x Next State: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+
+            } else {
+              // No room in the L1, so we need to make room in the L1
+
+              // Check if the line we want to evict is not locked
+              Addr addr := L1Icache.cacheProbe(in_msg.LineAddress);     // ME: get the addr that is going to be replaced
+              check_on_cache_probe(mandatoryQueue_in, addr);
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Icache invalid and unavailable Addr: %#x State: %s Sender: CPU Type: L1_Replacement\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+
+              trigger(Event:L1_Replacement, addr,
+                      getL1ICacheEntry(addr),
+                      TBEs[addr]);
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Addr: %#x Next State: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+
+            }
+          }
+        } else {
+
+          // *** DATA ACCESS ***
+          Entry L1Dcache_entry := getL1DCacheEntry(in_msg.LineAddress);
+          if (is_valid(L1Dcache_entry)) {
+
+            DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Dcache_entry valid Addr: %#x State: %s Sender: CPU Event: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress),mandatory_request_type_to_event(in_msg.Type));
+
+            // The tag matches for the L1, so the L1 ask the L2 for it
+            trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress,
+                    L1Dcache_entry, TBEs[in_msg.LineAddress]);
+
+            DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Addr: %#x Next State: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+
+          } else {
+            
+            ////****TODO // ME: data access, why check ICache?
+            // Check to see if it is in the OTHER L1
+            Entry L1Icache_entry := getL1ICacheEntry(in_msg.LineAddress);
+            if (is_valid(L1Icache_entry)) {
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Dcache_entry invalid, Icache_entry valid Addr: %#x State: %s Sender: CPU Event: L1_Replacement\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+
+              // The block is in the wrong L1, put the request on the queue to the shared L2
+              trigger(Event:L1_Replacement, in_msg.LineAddress,
+                      L1Icache_entry, TBEs[in_msg.LineAddress]);
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Addr: %#x Next State: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+        
+            }
+
+            if (L1Dcache.cacheAvail(in_msg.LineAddress)) {
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Dcache_entry invalid but available Addr: %#x State: %s Sender: CPU Event: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress),mandatory_request_type_to_event(in_msg.Type));
+
+              // L1 does't have the line, but we have space for it
+              // in the L1 let's see if the L2 has it.
+              trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress,
+                      L1Dcache_entry, TBEs[in_msg.LineAddress]);
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Addr: %#x Next State: %s\n",
+                in_msg.LineAddress, getState(TBEs[in_msg.LineAddress], getCacheEntry(in_msg.LineAddress), in_msg.LineAddress));
+
+            } else {
+              // No room in the L1, so we need to make room in the L1
+
+              // Check if the line we want to evict is not locked
+              Addr addr := L1Dcache.cacheProbe(in_msg.LineAddress);
+              check_on_cache_probe(mandatoryQueue_in, addr);
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Dcache_entry invalid and unavailable victim_Addr: %#x Requestor_Addr: %#x victim_State: %s Sender: CPU Event: L1_Replacement Type_of_Requestor: %s\n",
+                addr, in_msg.LineAddress, getState(TBEs[addr], getCacheEntry(addr), addr), in_msg.Type);
+
+              trigger(Event:L1_Replacement, addr,
+                      getL1DCacheEntry(addr),
+                      TBEs[addr]);
+
+              DPRINTF(RubySlicc, "@L1-mandatoryQueue_in Addr: %#x Next State: %s\n",
+                addr, getState(TBEs[addr], getCacheEntry(addr), addr));
+            }
+          }
+        }
+      }
+    }
+  }  
+
+  // req to L1Cache
+  in_port(requestL1Network_in, RequestMsg, requestToL1Cache, rank = 1) {
+    if(requestL1Network_in.isReady(clockEdge())) {
+      peek(requestL1Network_in, RequestMsg, block_on="addr") {
+        assert(in_msg.Destination.isElement(machineID));
+
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+
+        DPRINTF(RubySlicc, "@L1-requestL1Network_in Addr: %#x State: %s Requestor: %s Type: %s Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+        if (in_msg.Type == CoherenceRequestType:INV_OWN) {
+          trigger(Event:InvOwn, in_msg.addr, cache_entry, tbe);
+        } 
+        else if (in_msg.Type == CoherenceRequestType:INV_ELSE) {
+          trigger(Event:InvElse, in_msg.addr, cache_entry, tbe);
+        }
+        else if (in_msg.Type == CoherenceRequestType:GETX) {
+          trigger(Event:Fwd_GETX, in_msg.addr, cache_entry, tbe);
+        }
+        else if (in_msg.Type == CoherenceRequestType:GETS) {
+          trigger(Event:Fwd_GETS, in_msg.addr, cache_entry, tbe);
+        }
+        else if (in_msg.Type == CoherenceRequestType:GET_INSTR) {
+          trigger(Event:Fwd_GET_INSTR, in_msg.addr, cache_entry, tbe);
+        }
+        else {
+          error("Invalid forwarded request type");
+        }
+
+        DPRINTF(RubySlicc, "@L1-requestL1Network_in Addr: %#x Next State: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr));
+      }
+    }
+  }
+
+  // resp to L1Cache
+  in_port(responseL1Network_in, ResponseMsg, responseToL1Cache, rank = 2) {
+    if (responseL1Network_in.isReady(clockEdge())) {
+      peek(responseL1Network_in, ResponseMsg, block_on="addr") {
+        assert(in_msg.Destination.isElement(machineID));
+
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+        DPRINTF(RubySlicc, "@L1-responseL1Network_in Addr: %#x State: %s Sender: %s Type: %s Destination: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Sender, in_msg.Type, in_msg.Destination);
+                
+        if(in_msg.Type == CoherenceResponseType:DATA) {
+          trigger(Event:Data, in_msg.addr, cache_entry, tbe);
+        } 
+        else if (in_msg.Type == CoherenceResponseType:WB_ACK) {
+          trigger(Event:Writeback_Ack, in_msg.addr, cache_entry, tbe);
+        }
+        else {
+          error("Invalid L1 response type");
+        }
+
+        DPRINTF(RubySlicc, "@L1-responseL1Network_in Addr: %#x Next State: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr));
+
+      }
+    }
+  } 
+  // **************************************************ACTIONS************************************************** //
+
+  action(aa_issueGETS, "aa", desc="Issue GETS") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      enqueue(requestL1Network_out, RequestMsg, l1_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(createMachineID(MachineType:L2Cache, version));
+        DPRINTF(RubySlicc, "address: %#x, destination: %s\n",
+                address, out_msg.Destination);
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+      }
+    }
+  }
+
+  action(ab_issueGET_INSTR, "ab", desc="Issue GET_INSTR") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      enqueue(requestL1Network_out, RequestMsg, l1_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GET_INSTR;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(createMachineID(MachineType:L2Cache, version));
+        DPRINTF(RubySlicc, "address: %#x, destination: %s\n",
+                address, out_msg.Destination);
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+      }
+    }
+  }
+
+  action(b_issueGETX, "b", desc="Issue GETX") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      enqueue(requestL1Network_out, RequestMsg, l1_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETX;
+        out_msg.Requestor := machineID;
+        DPRINTF(RubySlicc, "%s\n", machineID);
+        out_msg.Destination.add(createMachineID(MachineType:L2Cache, version));
+
+        DPRINTF(RubySlicc, "address: %#x, destination: %s\n",
+                address, out_msg.Destination);
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+      }
+    }
+  }
+  
+  action(e_sendStoreDataToL2, "e", desc="Send new data to L2 when L1 hit") {
+    //peek(responseL1Network_in, ResponseMsg) {
+      enqueue(requestL1Network_out, RequestMsg, l1_request_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:L1_STORE_DATA;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(createMachineID(MachineType:L2Cache, version));
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.Dirty := cache_entry.Dirty;
+        out_msg.MessageSize := MessageSizeType:Control;
+        DPRINTF(RubySlicc, "@L1 sendStoreDataToL2, a write through approach, address: %#x, Next State: M\n",
+                address);
+    }
+  }
+  
+  action(e_IsendStoreDataToL2, "ei", desc="Forward new data to L2, L1 is I now") {
+    //peek(responseL1Network_in, ResponseMsg) {
+      enqueue(requestL1Network_out, RequestMsg, l1_request_latency) {
+        assert(is_valid(tbe));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:L1I_STORE_DATA;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(createMachineID(MachineType:L2Cache, version));
+        out_msg.DataBlk := tbe.DataBlk;
+        out_msg.Dirty := tbe.Dirty;
+        out_msg.MessageSize := MessageSizeType:Control;
+        DPRINTF(RubySlicc, "@L1 IsendStoreDataToL2, a write through approach, address: %#x, Next State: I\n",
+                address);
+    }
+  }
+
+  action(ee_sendDataFromTBE, "\e", desc="Send data from TBE to requestor") {
+    peek(requestL1Network_in, RequestMsg) {
+      enqueue(responseL1Network_out, ResponseMsg, l1_response_latency) {
+        assert(is_valid(tbe));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_INV_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := tbe.DataBlk;
+        out_msg.Dirty := tbe.Dirty;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        DPRINTF(RubySlicc, "@L1 sendDataFromTBE, triggered by 'Fwd_GETX, Fwd_GETS, Fwd_GET_INSTR, InvOwn' address: %#x, Next State: II\n",
+                address);
+      }
+    }
+  }
+
+  action(f_sendDataToL2, "f", desc="Send data to the L2 cache") {
+    enqueue(responseL1Network_out, ResponseMsg, l1_response_latency) {
+      assert(is_valid(cache_entry));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:DATA_INV_ACK;   // ME: return invalidation ack with data
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.Dirty := cache_entry.Dirty;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(createMachineID(MachineType:L2Cache, version));
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
+    }
+    cache_entry.Dirty := false;
+  }
+
+  action(ff_deallocateCacheBlock, "\f",
+         desc="Deallocate L1 cache block.") {
+    if (L1Dcache.isTagPresent(address)) {
+      L1Dcache.deallocate(address);
+    } else {
+      L1Icache.deallocate(address);
+    }
+    unset_cache_entry();
+  }
+
+  action(fi_sendInvAck, "fi", desc="Send INV_ACK to the L2 cache") {
+    //peek(requestL1Network_in, RequestMsg) {
+      enqueue(responseL1Network_out, ResponseMsg, l1_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:INV_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(createMachineID(MachineType:L2Cache, version));
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    //}
+  }
+  
+  ////**** TODO cant guarantee the correction
+  action(fi_sendInvAck_MI_I, "fim", desc="Send INV_ACK to the L2 cache") {
+    //peek(requestL1Network_in, RequestMsg) {
+      enqueue(responseL1Network_out, ResponseMsg, l1_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:INV_ACK_MI_I;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(createMachineID(MachineType:L2Cache, version));
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    //}
+  }
+
+  action(forward_eviction_to_cpu, "\cc", desc="Send eviction information to the processor") {  
+    if (send_evictions) {
+      DPRINTF(RubySlicc, "Sending invalidation for %#x to the CPU\n", address);
+      sequencer.evictionCallback(address);
+    }
+  }
+  
+  // no one asks the cache to do this
+  action(g_issuePUTX, "g", desc="Relinquish line to the L2 cache") {
+    enqueue(requestL1Network_out, RequestMsg, l1_response_latency) {
+      assert(is_valid(cache_entry));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:PUTX;
+      out_msg.Dirty := cache_entry.Dirty;
+      out_msg.Requestor := machineID;
+      out_msg.Destination.add(createMachineID(MachineType:L2Cache, version));
+
+      if (cache_entry.Dirty) {
+        out_msg.MessageSize := MessageSizeType:Writeback_Data;
+        out_msg.DataBlk := cache_entry.DataBlk;
+      } else {
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+      }
+    }
+  }
+
+  action(h_load_hit, "hd", desc="Notify sequencer the load completed (cache hit)") {
+    assert(is_valid(cache_entry));
+    DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
+    L1Dcache.setMRU(cache_entry);   // for replacement policy
+    sequencer.readCallback(address, cache_entry.DataBlk);
+  }
+   
+  action(h_ifetch_hit, "hi", desc="Notify sequencer the ifetch completed (cache hit)") {
+    assert(is_valid(cache_entry));
+    DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
+    L1Icache.setMRU(cache_entry);
+    sequencer.readCallback(address, cache_entry.DataBlk);
+  }
+
+  action(hh_store_hit, "\h", desc="Notify sequencer that store completed (cache hit)") {
+    assert(is_valid(cache_entry));
+    DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
+    L1Dcache.setMRU(cache_entry);
+    sequencer.writeCallback(address, cache_entry.DataBlk);
+    cache_entry.Dirty := true;     // cache entry is dirty, this is the only freshest copy
+  }
+
+  action(hhx_store_hit, "\hx", desc="Notify sequencer that store completed (cache miss)") {
+    assert(is_valid(tbe));
+    DPRINTF(RubySlicc, "before CPU writes %s\n", tbe.DataBlk);
+    //L1Dcache.setMRU(cache_entry);
+    sequencer.writeCallback(address, tbe.DataBlk,true);
+    DPRINTF(RubySlicc, "after CPU writes %s\n", tbe.DataBlk);
+    tbe.Dirty := true;
+  }
+
+  action(hx_load_hit, "hxd", desc="Notify sequencer the load completed (cache miss)") {
+    assert(is_valid(cache_entry));
+    DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
+    L1Dcache.setMRU(cache_entry);
+    sequencer.readCallback(address, cache_entry.DataBlk, true);
+  }
+
+  action(hx_ifetch_hit, "hxi", desc="Notify sequencer the ifetch completed (cache miss)") {
+    assert(is_valid(cache_entry));
+    DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
+    L1Icache.setMRU(cache_entry);
+    sequencer.readCallback(address, cache_entry.DataBlk, true);
+  }
+
+  action(i_allocateTBE, "i", desc="Allocate TBE (number of invalidates=0)") {
+    check_allocate(TBEs);
+    //assert(is_valid(cache_entry));
+    TBEs.allocate(address);
+    set_tbe(TBEs[address]);
+    //tbe.Dirty := cache_entry.Dirty;
+    //tbe.DataBlk := cache_entry.DataBlk;
+  }
+
+  action(k_popMandatoryQueue, "k", desc="Pop mandatory queue") {
+    mandatoryQueue_in.dequeue(clockEdge());
+  }
+
+  action(kd_wakeUpDependents, "kd", desc="Wake-up dependents") {
+    wakeUpAllBuffers(address);
+  }
+
+  action(l_popRequestQueue, "l",
+         desc="Pop incoming request queue and profile the delay within this virtual network") {
+    Tick delay := requestL1Network_in.dequeue(clockEdge());
+    profileMsgDelay(2, ticksToCycles(delay));
+  }
+
+  action(o_popIncomingResponseQueue, "o",
+         desc="Pop Incoming Response queue and profile the delay within this virtual network") {
+    Tick delay := responseL1Network_in.dequeue(clockEdge());
+    profileMsgDelay(1, ticksToCycles(delay));
+  }
+
+  action(oo_allocateDCacheBlock, "\o", desc="Set L1 D-cache tag equal to tag of block B") {
+    if (is_invalid(cache_entry)) {
+      set_cache_entry(L1Dcache.allocate(address, new Entry));
+    }
+  }
+
+  action(pp_allocateICacheBlock, "\p", desc="Set L1 I-cache tag equal to tag of block B") {
+    if (is_invalid(cache_entry)) {
+      set_cache_entry(L1Icache.allocate(address, new Entry));
+    }
+  }
+
+  action(s_deallocateTBE, "s", desc="Deallocate TBE") {
+    TBEs.deallocate(address);
+    unset_tbe();
+  }
+
+  action(u_writeDataToCache, "u", desc="Write data to Dcache") {
+    peek(responseL1Network_in, ResponseMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.DataBlk := in_msg.DataBlk;
+      cache_entry.Dirty := in_msg.Dirty;
+      
+      DPRINTF(RubySlicc, "@@L1-write data from responseL1Network_in to L1cache Addr: %#x Next State: M\n",
+                in_msg.addr);      
+    }
+  }
+
+  action(u_writeInstToCache, "ui", desc="Write inst to Icache") {
+    peek(responseL1Network_in, ResponseMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.DataBlk := in_msg.DataBlk;
+      cache_entry.Dirty := in_msg.Dirty;
+
+      DPRINTF(RubySlicc, "@@L1-write Inst data from responseL1Network_in to L1cache Addr: %#x Next State: M\n",
+                in_msg.addr);   
+    }
+  }
+
+  action(u_writeDataToTBE, "uj", desc="Write data to DTBE") {
+    peek(responseL1Network_in, ResponseMsg) {
+      assert(is_valid(tbe));
+      tbe.DataBlk := in_msg.DataBlk;
+      tbe.Dirty := in_msg.Dirty;
+      
+      DPRINTF(RubySlicc, "@@L1-write data from responseL1Network_in to L1TBE Addr: %#x Next State: I\n",
+                in_msg.addr);      
+    }
+  }
+
+  action(uu_profileInstMiss, "\ui", desc="Profile the demand miss") {
+    L1Icache.profileDemandMiss();
+  }
+
+  action(uu_profileInstHit, "\uih", desc="Profile the demand hit") {
+    L1Icache.profileDemandHit();
+  }
+
+  action(uu_profileDataMiss, "\ud", desc="Profile the demand miss") {
+    L1Dcache.profileDemandMiss();
+  }
+
+  action(uu_profileDataHit, "\udh", desc="Profile the demand hit") {
+    L1Dcache.profileDemandHit();
+  }
+
+  action(x_copyDataFromCacheToTBE, "x", desc="Copy data from cache to TBE") {
+    assert(is_valid(cache_entry));
+    assert(is_valid(tbe));
+    tbe.DataBlk := cache_entry.DataBlk;
+    tbe.Dirty := cache_entry.Dirty;
+  }
+
+  action(z_stallAndWaitMandatoryQueue, "\z", desc="Stall cpu request queue") {
+    stall_and_wait(mandatoryQueue_in, address);
+  }
+
+  action(z_stallAndWaitL1RequestQueue, "\zreq", desc="Stall L1 request queue") {
+    stall_and_wait(requestL1Network_in, address);
+  }
+
+  action(z_stallAndWaitL1ResponseQueue, "\zresp", desc="Stall L1 response queue") {
+    stall_and_wait(responseL1Network_in, address);
+  }
+
+  // **************************************************TRANSITIONS************************************************** //
+
+  transition({Inst_IS, IS}, {Load, Ifetch, Store, L1_Replacement}) {
+    z_stallAndWaitMandatoryQueue;
+  }
+  transition(Ia, {Load, Ifetch, Store, L1_Replacement}) {
+    z_stallAndWaitMandatoryQueue;
+  }
+
+  // Transitions from Idle
+  transition(I, Load, IS) {
+    oo_allocateDCacheBlock;
+    i_allocateTBE;
+    aa_issueGETS;    // send GETS request to lower storage level
+    uu_profileDataMiss;
+    //po_observeMiss;
+    k_popMandatoryQueue;
+  }
+
+  transition(I, Ifetch, Inst_IS) {
+    pp_allocateICacheBlock;
+    i_allocateTBE;
+    ab_issueGET_INSTR;
+    uu_profileInstMiss;
+    //po_observeMiss;
+    k_popMandatoryQueue;
+  }
+
+  // receive invalidation request from L2
+  // InvOwn: L2 receives msg from L1, triggers L2 replacement, but there's still copy in L1, so invalidate L1 is needed
+  // InvElse: L2 receives Inv and 3 GET from L3, the block is available in both L2 and L3, we need to invalidate L1 first
+  transition(I, {InvOwn, InvElse}) {
+    forward_eviction_to_cpu;
+    fi_sendInvAck;   // send INV_ACK to L2
+    l_popRequestQueue;
+  }
+
+  transition({IS, Inst_IS}, {InvOwn, InvElse}) {
+    z_stallAndWaitL1RequestQueue;
+  }
+  // transition(IM, {InvOwn, InvElse}) {
+  //   z_stallAndWaitL1RequestQueue;
+  // }
+
+
+  // ////**** TODO don't know whether InvElse here is correct
+  // transition({IS, IM, Inst_IS}, {InvOwn, InvElse}) {
+  //   z_stallAndWaitL1RequestQueue;
+  // }
+
+  transition(I, Writeback_Ack) {
+    o_popIncomingResponseQueue;
+  }
+
+  ////**** TODO not sure about this
+  transition({Inst_IS, IS}, Writeback_Ack) {   // L2 inform L1 that it has received the data
+    o_popIncomingResponseQueue;
+  }
+  // transition(IM, Writeback_Ack) {   // L2 inform L1 that it has received the data
+  //   o_popIncomingResponseQueue;
+  // }
+
+  // Transition from Modified
+  transition(M, Load) {
+    h_load_hit;
+    uu_profileDataHit;
+    //pph_observePfHit;
+    k_popMandatoryQueue;
+  }
+
+  transition(M, Ifetch) {
+    h_ifetch_hit;
+    uu_profileInstHit;
+    //pph_observePfHit;
+    k_popMandatoryQueue;
+  }
+
+
+  transition(M, L1_Replacement, MI) {
+    i_allocateTBE
+    g_issuePUTX;   // send put req and the data to the lower storage
+    x_copyDataFromCacheToTBE
+    forward_eviction_to_cpu;
+    ff_deallocateCacheBlock;
+  }
+
+  ////**** TODO cant guarantee the correction
+  transition(M, Writeback_Ack) {
+    o_popIncomingResponseQueue;
+  }
+
+  transition(MI, Writeback_Ack, I){
+    s_deallocateTBE;
+    fi_sendInvAck_MI_I;              ////**** TODO I add this line to inform L2 of L1's transition to I state
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  ////****TODO dont know whether it is approperiate to add InvOwn/InvELse here
+  transition(MI, {Fwd_GETX, Fwd_GETS, Fwd_GET_INSTR, InvOwn, InvElse}, II){
+    ee_sendDataFromTBE;
+    l_popRequestQueue;
+  }
+
+  transition(II, Writeback_Ack, I) {         // the PUTX is still transfering, when L2 receives L1_PUTX and update, L2 need to send ack to L1
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+  
+  transition(II, InvOwn) {         // the PUTX is still transfering, when L2 receives L1_PUTX and update, L2 need to send ack to L1
+    //o_popIncomingResponseQueue;
+    z_stallAndWaitL1RequestQueue;     ////**** TODO don't know whether to stall or just pop
+  }
+
+  ////**** TODO can't gurantee the correctness
+  transition(II, {Load, Store, Ifetch}) {
+    z_stallAndWaitMandatoryQueue;
+  }
+
+  transition(MI, {Load, Ifetch, Store, L1_Replacement}){
+    z_stallAndWaitMandatoryQueue;
+  }
+
+
+  // ************************** end ver2 ********************** //
+
+  transition(M, {InvOwn, InvElse, Fwd_GETX, Fwd_GETS, Fwd_GET_INSTR}, I) {     ////**** TODO this can be MI
+    forward_eviction_to_cpu;     // send data to L2 together with inv_ack
+    f_sendDataToL2;            ////****TODO // with forward msg, why we send data to L2 not the L1 requestor
+    ff_deallocateCacheBlock;
+    l_popRequestQueue;
+  }
+
+  transition(IS, Data, M) {   
+    u_writeDataToCache;
+    hx_load_hit;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;           ////****TODO // why here need to wake up ?
+  }
+ 
+  transition(Inst_IS, Data, M) {
+    u_writeInstToCache;
+    hx_ifetch_hit;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+//******************************WT*********************//
+  transition(I, Store, Ia) {
+    i_allocateTBE;
+    b_issueGETX;
+    uu_profileDataMiss;
+    //po_observeMiss;
+    k_popMandatoryQueue;
+  }
+
+  transition(Ia, Data, Iaa) {
+    //oo_allocateDCacheBlock;
+
+    u_writeDataToTBE;       // write old data from L2 to L1's temporary cache_entry
+    hhx_store_hit;            // copy CPU's new data to L1' temporary cache_entry
+    e_IsendStoreDataToL2;
+
+    //ff_deallocateCacheBlock;  // deallocate L1 cache_entry
+    //s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    //kd_wakeUpDependents;
+  }
+
+  transition(Ia, Writeback_Ack) {
+    o_popIncomingResponseQueue;
+  }
+
+  transition(Iaa, Writeback_Ack, I) {
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(Iaa, {InvOwn, InvElse}) {
+    z_stallAndWaitL1RequestQueue;
+  }
+  
+  transition(Iaa, {Store, Load, Ifetch}) {
+    z_stallAndWaitMandatoryQueue;
+  }
+
+  transition(Ia, {InvOwn, InvElse}) {
+    l_popRequestQueue;
+  }
+
+  transition(M, Store) {
+    hh_store_hit;
+    uu_profileDataHit;
+    e_sendStoreDataToL2;
+    //pph_observePfHit;
+    k_popMandatoryQueue;
+  }
+
+//******************************WT*********************//
+
+  ////****TODO // not sure if the below transition is correct
+  transition({IS, Inst_IS}, {Fwd_GETS, Fwd_GETX, Fwd_GET_INSTR}){
+    z_stallAndWaitL1RequestQueue;
+  }
+  // transition(IM, {Fwd_GETS, Fwd_GETX, Fwd_GET_INSTR}){
+  //   z_stallAndWaitL1RequestQueue;
+  // }
+
+  transition(I, L1_Replacement) {
+    ff_deallocateCacheBlock;
+  }
+}
+    
+

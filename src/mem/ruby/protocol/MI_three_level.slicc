@@ -1,0 +1,8 @@
+protocol "MI_three_level";
+include "RubySlicc_interfaces.slicc";
+include "MI_three_level_msg.sm";
+include "MI_three_level_L1Cache.sm";
+include "MI_three_level_L2Cache.sm";
+include "MI_three_level_L3Cache.sm";
+include "MI_three_level_dir.sm";
+include "MI_three_level_dma.sm";
